@@ -69,10 +69,33 @@ round-trips including multi-page and corrupted sets. Payloads are random
 ## Repository layout
 
 ```
-index.html   the program, the tests and the documentation
+index.html   the library program, its tests and the documentation
+otp.html     PBOTP v1: one-time-pad / password-stream encryption with a
+             self-contained DEFLATE and SHA-256 (see below)
 LICENSE      GNU Affero General Public License v3 or later
 README.md    this file
 ```
+
+## OTP (otp.html)
+
+`otp.html` encrypts any text or file, losslessly:
+
+- *One-time pad mode*: a uniform random pad as long as the payload, generated
+  with `crypto.getRandomValues`, shown once, stored nowhere. XOR applied after
+  optional DEFLATE compression. Perfect secrecy holds under the classical pad
+  rules (random, secret, at least payload length, never reused).
+- *Password-stream mode*: keystream blocks `SHA-256(salt || password ||
+  counter)`. Practical key transport, explicitly not perfect secrecy.
+- Container `PBOTP v1`: magic, version, flags, payload length, 4-byte
+  SHA-256 tag, 8-byte salt, ciphertext; transported as RFC4648 base32. Wrong
+  keys, truncation and single bit flips are detected via the tag.
+- Compression runs **before** encryption only. XOR with a random pad yields
+  uniform bytes, which no lossless compressor can shrink; the self-test
+  demonstrates this. Encrypt-then-compress is not offered.
+- SHA-256 (FIPS 180-4) and DEFLATE (RFC 1951, stored/fixed/dynamic blocks)
+  are implemented in the file itself. Streams written by other zlib-family
+  tools decode here, and streams written here decode under Node's zlib
+  (cross-implementation tests). No dependencies, works from file://.
 
 ## Prior art and credits
 

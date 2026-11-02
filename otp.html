@@ -1,0 +1,516 @@
+<!doctype html>
+<!--
+  Pixel Babel OTP — PBOTP v1: one-time-pad and password-stream container
+  with a self-contained DEFLATE codec and SHA-256.
+  Copyright (C) 2026 moon440
+  SPDX-License-Identifier: AGPL-3.0-or-later
+
+  This program is free software: you can redistribute it and/or modify it under
+  the terms of the GNU Affero General Public License as published by the Free
+  Software Foundation, either version 3 of the License, or (at your option) any
+  later version. See the file LICENSE for the full text. Under section 13 of
+  that license, a modified version made available over a network must also
+  offer its source.
+
+  Contents
+    SHA-256 (FIPS 180-4), pure JS, known-answer tested.
+    DEFLATE (RFC 1951):
+      compressor   — fixed Huffman codes, LZ77 matches via hash chains,
+                     bounded search, lazy match skipped for clarity.
+      decompressor — stored, fixed and dynamic blocks (full inflate), so
+                     streams written by other zlib-family tools decode here.
+    PBOTP v1 container (base32 transport, RFC4648 alphabet, no padding):
+      magic "PB" | version 1 | flags | plainLen u32le | salt 8B | ct ...
+      flags bit0 = 0 one-time pad, 1 password stream
+      flags bit1 = 1 when payload was DEFLATE-compressed before encryption
+      ct = payload XOR keystream
+        OTP:      keystream = pad (uniform random, length >= payload).
+        password: block i = SHA-256(salt || password || i_le32). CTR-style,
+                  immune to length extension. NOT perfect secrecy.
+      tag = SHA-256(payload)[0..3] stored after the salt (see layout below).
+
+  Final byte layout (offsets):
+    0..1   "PB"
+    2      version = 1
+    3      flags
+    4..7   payloadLen (bytes after the optional inflate step, little endian)
+    8..11  tag = SHA-256(payload)[0..3]  (payload = compressed if flags bit1)
+    12..19 salt (zero-filled in OTP mode)
+    20..   ciphertext (payloadLen bytes)
+
+  Statements by design, not taste:
+    1. Compress before encrypt. XOR with a random pad gives uniform random
+       bytes; no lossless compressor can shrink them (pigeonhole principle).
+       Encrypt-then-compress is not offered.
+    2. Perfect secrecy holds only if the pad is uniform random, secret, at
+       least as long as the payload, and never reused — not one byte. The pad
+       is shown once at encryption and stored nowhere by this program.
+       A Pixel Babel page address is public and enumerable; it is not a key.
+    3. The tag is an integrity locator for typos/corruption, not authenticity:
+       XOR ciphertext is malleable. Anyone able to flip bits can flip plaintext.
+
+  Portability: no imports, no build, no network. TextEncoder/TextDecoder,
+  crypto.getRandomValues, Uint8Array, DataView — all stable in every modern
+  browser and loadable from file://.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Pixel Babel OTP — PBOTP v1</title>
+<style>
+  :root{--bg:#0d0f12;--fg:#d8dee4;--dim:#8b949e;--acc:#e8b84b;--card:#15181d;--line:#2a2f37;--err:#f05d5d;--ok:#4ac26b}
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.5 ui-monospace,Consolas,monospace}
+  header{padding:12px 20px;border-bottom:1px solid var(--line);display:flex;gap:12px;align-items:baseline;flex-wrap:wrap}
+  header h1{margin:0;font-size:17px;color:var(--acc)}
+  main{max-width:1100px;margin:0 auto;padding:14px 20px}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:6px;padding:12px 14px;margin-bottom:14px}
+  .card h2{margin:0 0 8px;font-size:13px;color:var(--acc);text-transform:uppercase;letter-spacing:2px}
+  textarea{width:100%;background:#0a0c0f;color:#9fd356;border:1px solid var(--line);border-radius:4px;padding:8px;font:12px/1.45 inherit}
+  button,select,input[type=password],input[type=text]{background:#22262d;color:var(--fg);border:1px solid var(--line);border-radius:4px;padding:6px 11px;font:inherit}
+  button{cursor:pointer}
+  button:hover{border-color:var(--acc)}
+  .row{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin:8px 0}
+  .dim{color:var(--dim)}.ok{color:var(--ok)}.err{color:var(--err)}
+  pre{white-space:pre-wrap;word-break:break-all;background:#0a0c0f;border:1px solid var(--line);border-radius:4px;padding:8px;font-size:12px;margin:6px 0;max-height:260px;overflow:auto}
+  .grid-note{font-size:12px;color:var(--dim)}
+  footer{padding:10px 20px;border-top:1px solid var(--line);color:var(--dim);font-size:12px}
+</style>
+</head>
+<body>
+<header><h1>PBOTP v1</h1><span class="dim">one-time pad · password stream · self-contained DEFLATE + SHA-256 · AGPL-3.0-or-later</span></header>
+<main>
+  <div class="card">
+    <h2>Encrypt</h2>
+    <div class="row">
+      <select id="kmode">
+        <option value="otp">One-time pad — perfect secrecy if the pad rules hold</option>
+        <option value="pwd">Password stream — practical key transport, not perfect secrecy</option>
+      </select>
+      <label class="dim"><input type="checkbox" id="cmp" checked> compress before encryption</label>
+      <input type="password" id="pw" placeholder="password (password mode)" style="width:240px">
+    </div>
+    <textarea id="plain" rows="4" placeholder="text — any Unicode; or load a file below"></textarea>
+    <div class="row"><input type="file" id="fin"><button id="bEncTxt">Encrypt text</button><button id="bEncFile">Encrypt file</button><span id="fileInfo" class="dim"></span></div>
+    <pre id="padOut" style="display:none"></pre>
+    <textarea id="ct" rows="4" readonly spellcheck="false"></textarea>
+    <div class="row"><button id="bCtDl">Download .pbotp</button><span id="encInfo" class="dim"></span></div>
+    <div class="grid-note">The pad is the key. Generated once, shown once, stored nowhere. Exchange it over a secret channel and destroy every copy after one use. Any reuse of pad bytes, in any part, breaks perfect secrecy.</div>
+  </div>
+  <div class="card">
+    <h2>Decrypt</h2>
+    <div class="row"><textarea id="ctIn" rows="3" placeholder="paste PBOTP container (base32)" style="flex:1"></textarea></div>
+    <div class="row"><input type="text" id="padIn" placeholder="pad, base32 (OTP mode)" style="flex:1;min-width:240px"><input type="password" id="pw2" placeholder="password (password mode)" style="width:240px"><button id="bDec">Decrypt</button></div>
+    <div id="decInfo" class="dim"></div>
+    <textarea id="decOut" rows="4" readonly></textarea>
+    <div class="row"><button id="bDecDl">Download decrypted bytes</button></div>
+  </div>
+  <div class="card">
+    <h2>Self-test</h2>
+    <div class="row"><button id="bTest">Run</button><span id="testSum"></span></div>
+    <pre id="testLog"></pre>
+    <div class="grid-note">SHA-256 known answers; inflate against fixed- and dynamic-Huffman streams encoded by an independent zlib; deflate round-trips on text, binary, repetitive and random data; container round-trips for both key modes; wrong-key, truncation and bit-flip rejection; the pigeonhole check that random ciphertext does not compress.</div>
+  </div>
+</main>
+<footer>Copyright (C) 2026 moon440 · AGPL-3.0-or-later · full license text in the repository LICENSE file</footer>
+<script>
+'use strict';
+/* ------------------------------------------------------------------ */
+/* SHA-256 (FIPS 180-4). Byte-array padding (no DataView): the in-page
+   self-test pins it against FIPS known-answer vectors on every load. */
+const SHA_K=new Uint32Array([
+  0x428a2f98,0x71374491,0xb5c0fbcf,0xe9b5dba5,0x3956c25b,0x59f111f1,0x923f82a4,0xab1c5ed5,
+  0xd807aa98,0x12835b01,0x243185be,0x550c7dc3,0x72be5d74,0x80deb1fe,0x9bdc06a7,0xc19bf174,
+  0xe49b69c1,0xefbe4786,0x0fc19dc6,0x240ca1cc,0x2de92c6f,0x4a7484aa,0x5cb0a9dc,0x76f988da,
+  0x983e5152,0xa831c66d,0xb00327c8,0xbf597fc7,0xc6e00bf3,0xd5a79147,0x06ca6351,0x14292967,
+  0x27b70a85,0x2e1b2138,0x4d2c6dfc,0x53380d13,0x650a7354,0x766a0abb,0x81c2c92e,0x92722c85,
+  0xa2bfe8a1,0xa81a664b,0xc24b8b70,0xc76c51a3,0xd192e819,0xd6990624,0xf40e3585,0x106aa070,
+  0x19a4c116,0x1e376c08,0x2748774c,0x34b0bcb5,0x391c0cb3,0x4ed8aa4a,0x5b9cca4f,0x682e6ff3,
+  0x748f82ee,0x78a5636f,0x84c87814,0x8cc70208,0x90befffa,0xa4506ceb,0xbef9a3f7,0xc67178f2]);
+const SHA_H0=new Uint32Array([0x6a09e667,0xbb67ae85,0x3c6ef372,0xa54ff53a,0x510e527f,0x9b05688c,0x1f83d9ab,0x5be0cd19]);
+function sha256(bytes){
+  const rotr=(x,n)=>((x>>>n)|(x<<(32-n)))>>>0;
+  const pad=Array.from(bytes);
+  pad.push(0x80);
+  while(pad.length%64!==56)pad.push(0);
+  const bl=bytes.length*8;
+  pad.push(0,0,0,0,(bl>>>24)&255,(bl>>>16)&255,(bl>>>8)&255,bl&255);
+  let[h0,h1,h2,h3,h4,h5,h6,h7]=SHA_H0;
+  const W=new Array(64);
+  for(let off=0;off<pad.length;off+=64){
+    for(let t=0;t<16;t++)W[t]=((pad[off+4*t]<<24)|(pad[off+4*t+1]<<16)|(pad[off+4*t+2]<<8)|pad[off+4*t+3])>>>0;
+    for(let t=16;t<64;t++){
+      const w15=W[t-15],w2=W[t-2];
+      const s0=(rotr(w15,7)^rotr(w15,18)^(w15>>>3))>>>0;
+      const s1=(rotr(w2,17)^rotr(w2,19)^(w2>>>10))>>>0;
+      W[t]=(W[t-16]+s0+W[t-7]+s1)>>>0;
+    }
+    let a=h0,b=h1,c=h2,d=h3,e=h4,f=h5,g=h6,h=h7;
+    for(let t=0;t<64;t++){
+      const S1=(rotr(e,6)^rotr(e,11)^rotr(e,25))>>>0;
+      const ch=((e&f)^(~e&g))>>>0;
+      const t1=(h+S1+ch+SHA_K[t]+W[t])>>>0;
+      const S0=(rotr(a,2)^rotr(a,13)^rotr(a,22))>>>0;
+      const maj=((a&b)^(a&c)^(b&c))>>>0;
+      const t2=(S0+maj)>>>0;
+      h=g;g=f;f=e;e=(d+t1)>>>0;d=c;c=b;b=a;a=(t1+t2)>>>0;
+    }
+    h0=(h0+a)>>>0;h1=(h1+b)>>>0;h2=(h2+c)>>>0;h3=(h3+d)>>>0;h4=(h4+e)>>>0;h5=(h5+f)>>>0;h6=(h6+g)>>>0;h7=(h7+h)>>>0;
+  }
+  const out=new Uint8Array(32);
+  [h0,h1,h2,h3,h4,h5,h6,h7].forEach((x,i)=>{out[4*i]=x>>>24&255;out[4*i+1]=x>>>16&255;out[4*i+2]=x>>>8&255;out[4*i+3]=x&255});
+  return out;
+}
+
+/* ------------------------------------------------------------------ */
+/* base32 (RFC4648 alphabet, no padding). Same mapping as Pixel Babel. */
+/* ------------------------------------------------------------------ */
+const B32A='ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
+function b32e(b){let acc=0,bits=0,s='';for(let i=0;i<b.length;i++){acc=((acc<<8)|b[i])>>>0;bits+=8;while(bits>=5){bits-=5;s+=B32A[(acc>>>bits)&31];}}if(bits>0)s+=B32A[(acc<<(5-bits))&31];return s}
+function b32d(str){let acc=0,bits=0;const out=[];for(let i=0;i<str.length;i++){const v=B32A.indexOf(str[i]);if(v<0)return null;acc=((acc<<5)|v)>>>0;bits+=5;if(bits>=8){bits-=8;out.push((acc>>>bits)&255);}}return new Uint8Array(out)}
+
+/* ------------------------------------------------------------------ */
+/* Canonical Huffman tables from bit lengths (RFC 1951 3.2.2).         */
+/* ------------------------------------------------------------------ */
+function buildHuff(lengths){
+  /* canonical per RFC1951 3.2.2 with the fixed-tree convention: code numbering
+     advances through lengths even if a length class is empty in the DYNAMIC
+     sense only when it is shorter than the minimum used length — the fixed
+     literal tree of RFC1951 starts 8-bit codes at 48 because lengths 7 exist
+     (24 codes): next8 = (next7 + cnt7) << 1 with next7=0 → 48. */
+  const bl=Array.from(lengths),n=bl.length;
+  const cnt=new Array(16).fill(0);
+  for(const b of bl)if(b>0)cnt[b]++;
+  const code=new Array(n).fill(0);
+  let c=0;
+  const minLen=(()=>{for(let l=1;l<=15;l++)if(cnt[l])return l;return 1})();
+  c=0;
+  for(let len=minLen;len<=15;len++){for(let sym=0;sym<n;sym++)if(bl[sym]===len)code[sym]=c++;c<<=1}
+  const table=[];
+  for(let sym=0;sym<n;sym++)if(bl[sym]>0)table[code[sym]]={len:bl[sym],sym};
+  return {code,table};
+}
+/* Fixed literal/length tree per RFC1951 3.2.6: 0..143:8, 144..255:9, 256..279:7, 280..287:8
+   → spec codes 48..191, 400..511, 48..127(len7), 192..199. */
+const FIXED_L=buildHuff((()=>{const l=new Array(288);for(let i=0;i<144;i++)l[i]=8;for(let i=144;i<256;i++)l[i]=9;for(let i=256;i<280;i++)l[i]=7;for(let i=280;i<288;i++)l[i]=8;return l})());
+const FIXED_D=buildHuff(new Array(30).fill(5));
+const LBASE=[3,4,5,6,7,8,9,10,11,13,15,17,19,23,27,31,35,43,51,59,67,83,99,115,131,163,195,227,258];
+const LEXT=[0,0,0,0,0,0,0,0,1,1,1,1,2,2,2,2,3,3,3,3,4,4,4,4,5,5,5,5,0];
+const DBASE=[1,2,3,4,5,7,9,13,17,25,33,49,65,97,129,193,257,385,513,769,1025,1537,2049,3073,4097,6145,8193,12289,16385,24577];
+const DEXT=[0,0,0,0,1,1,2,2,3,3,4,4,5,5,6,6,7,7,8,8,9,9,10,10,11,11,12,12,13,13];
+
+/* ------------------------------------------------------------------ */
+/* Deflate compressor: one fixed-Huffman final block + LZ77 hash chain. */
+/* ------------------------------------------------------------------ */
+function deflate(data){
+  /* try fixed-Huffman+LZ77; fall back to a stored block when it does not
+     actually shrink (incompressible input pays ~6% for fixed codes). */
+  const trial=deflateFixed(data);
+  if(trial.length>=data.length)return deflateStored(data);
+  return trial;
+}
+function deflateStored(data){
+  const n=data.length;
+  const nl=(~n)>>>0;
+  const out=[0x01, n&255,(n>>>8)&255, nl&255,(nl>>>8)&255];
+  /* one header byte (BFINAL=1, BTYPE=00, 5 padding bits), then LEN NLEN raw */
+  for(const b of data)out.push(b);
+  return new Uint8Array(out);
+}
+function deflateFixed(data){
+  const out=[];let bitBuf=0,bitCnt=0;
+  const put=(v,n)=>{bitBuf|=(v&((1<<n)-1))<<bitCnt;bitCnt+=n;while(bitCnt>=8){out.push(bitBuf&255);bitBuf>>>=8;bitCnt-=8}};
+  const emit=(code,len)=>{for(let i=len-1;i>=0;i--)put((code>>>i)&1,1)};
+  const head=new Int32Array(32768).fill(-1),prev=new Int32Array(32768);
+  const hkey=i=>(((data[i]|0)^((data[i+1]|0)<<5)^((data[i+2]|0)<<10))>>>0)&0x7fff;
+  function findMatch(pos){
+    let bl=2,bi=-1,steps=0;
+    for(let h=head[hkey(pos)];h>=0&&steps<96;steps++,h=prev[h&0x7fff]){
+      if(h>=pos)continue;
+      if(pos-h>32768)break;
+      let l=0;
+      while(l<258&&pos+l<data.length&&data[h+l]===data[pos+l])l++;
+      if(l>bl){bl=l;bi=h}
+    }
+    return {len:bl,dist:bi<0?0:pos-bi};
+  }
+  const n=data.length;let i=0;
+  put(1,1);put(1,1);put(0,1); /* BFINAL=1, BTYPE=01 fixed: stream order is bit0 then bit1 */
+  while(i<n){
+    let m={len:0,dist:0};
+    if(i+3<=n)m=findMatch(i);
+    if(m.len>=3){
+      let lsym=0;for(let k=28;k>=0;k--)if(m.len>=LBASE[k]){lsym=257+k;break}
+      emit(FIXED_L.code[lsym],FIXED_L.table[FIXED_L.code[lsym]].len);
+      put(m.len-LBASE[lsym-257],LEXT[lsym-257]);
+      let dsym=0;for(let k=29;k>=0;k--)if(m.dist>=DBASE[k]){dsym=k;break}
+      emit(FIXED_D.code[dsym],5);
+      put(m.dist-DBASE[dsym],DEXT[dsym]);
+      for(let j=i;j<i+m.len;j++){if(j+3<=n){const k2=hkey(j);prev[j&0x7fff]=head[k2];head[k2]=j}}
+      i+=m.len;
+    }else{
+      const x=data[i];
+      emit(FIXED_L.code[x],x<144?8:9);
+      if(i+3<=n){const k2=hkey(i);prev[i&0x7fff]=head[k2];head[k2]=i}
+      i++;
+    }
+  }
+  emit(FIXED_L.code[256],7); /* end of block */
+  if(bitCnt>0)out.push(bitBuf&255);
+  return new Uint8Array(out);
+}
+
+/* ------------------------------------------------------------------ */
+/* Inflate: stored, fixed and dynamic blocks.                          */
+/* ------------------------------------------------------------------ */
+function inflate(src,maxOut){
+  let bp=0,bitAcc=0,bitCache=0;
+  const need=(nbits)=>{while(bitCache<nbits&&bp<src.length){bitAcc|=src[bp++]<<bitCache;bitCache+=8}};
+  const bits=(k)=>{need(k);const v=bitAcc&((1<<k)-1);bitAcc>>>=k;bitCache-=k;return v};
+  const decode=(table)=>{
+    let code=0,len=0;
+    for(;;){
+      need(16);
+      code=(code<<1)|bits(1);len++;
+      const e=table[code];
+      if(e!==undefined&&e.len===len)return e.sym;
+      if(len>15)throw new Error('inflate: invalid code');
+    }
+  };
+  const out=new Uint8Array(maxOut||(1<<24));let n=0;
+  const push=b=>{if(n>=out.length)throw new Error('inflate: output limit');out[n++]=b};
+  let last;
+  do{
+    last=bits(1);const type=bits(2);
+    if(type===0){
+      /* stored block: discard the remaining bits of the current byte only */
+      const rem=bitCache&7;bitAcc>>>=rem;bitCache-=rem;
+      if(bp+4>src.length)throw new Error('inflate: short stored header');
+      const len=src[bp]|(src[bp+1]<<8),nlen=src[bp+2]|(src[bp+3]<<8);
+      if((len^(nlen^0xffff))!==0)throw new Error('inflate: stored length check');
+      bp+=4;
+      for(let k=0;k<len;k++)push(src[bp++]);
+    }else if(type===1||type===2){
+      let LT,DT;
+      if(type===1){LT=FIXED_L.table;DT=FIXED_D.table}
+      else{
+        const hlit=bits(5)+257,hdist=bits(5)+1,hclen=bits(4)+4;
+        const ORD=[16,17,18,0,8,7,9,6,10,5,11,4,12,3,13,2,14,1,15];
+        const cl=new Array(19).fill(0);
+        for(let k=0;k<hclen;k++)cl[ORD[k]]=bits(3);
+        const clt=buildHuff(cl).table;
+        const lens=[];
+        while(lens.length<hlit+hdist){
+          const s=decode(clt);
+          if(s<16)lens.push(s);
+          else if(s===16){const p=lens[lens.length-1];const r=3+bits(2);for(let k=0;k<r;k++)lens.push(p)}
+          else if(s===17){const r=3+bits(3);for(let k=0;k<r;k++)lens.push(0)}
+          else{const r=11+bits(7);for(let k=0;k<r;k++)lens.push(0)}
+        }
+        LT=buildHuff(lens.slice(0,hlit)).table;
+        DT=buildHuff(lens.slice(hlit)).table;
+      }
+      for(;;){
+        const s=decode(LT);
+        if(s===256)break;
+        if(s<256)push(s);
+        else{
+          const li=s-257;
+          const len=LBASE[li]+bits(LEXT[li]);
+          const ds=decode(DT);
+          const dist=DBASE[ds]+bits(DEXT[ds]);
+          if(dist>n)throw new Error('inflate: distance before start');
+          for(let k=0;k<len;k++)push(out[n-dist]);
+        }
+      }
+    }else throw new Error('inflate: reserved block type');
+  }while(!last);
+  return out.slice(0,n);
+}
+
+/* Reference DEFLATE streams, produced by Node's zlib (deflateRawSync), an
+   independent implementation, and inlined as base32 to keep this file offline:
+   STORED = level 0 | FIXED = level 1 | DYN = level 9 on a 6000-byte
+   pseudo-random string. The inflate tests below decode these foreign streams. */
+const ZX='ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
+function zb32d(str){let acc=0,bits=0;const out=[];for(let i=0;i<str.length;i++){const v=ZX.indexOf(str[i]);if(v<0)return null;acc=((acc<<5)|v)>>>0;bits+=5;if(bits>=8){bits-=8;out.push((acc>>>bits)&255)}}return new Uint8Array(out)}
+const V_STORED=zb32d('AEMABZ77ON2G64TFMQQHIZLTOQQGG33OORSW45BANBSXEZI');
+const V_FIXED=zb32d('ZNEM3SOJK7EMARYCAA');
+const V_DYN=zb32d('5XGIGAIDAEAABMKZX23G3W5WNW53W54QLYDIRIHXU2N7HK6MCIVPINRPWUZV4HI7IUDF7JVVXDE23YLCP755NOASWXEUS3HUM7N4XO6CCYUQ25Q7VU5VTH46EWTEBLVTPIUO3UPSOD75K6KSRXMUK2QO4256XJ6KCGVYYDQCHE4TSOJZHE4TSOJZHE4TSOJZHE4TSOJZHH4X7ZB7');
+function dynPlaintext(){const a=[];for(let i=0;i<6000;i++)a.push(33+(i*7919)%93);return new Uint8Array(a)}
+
+/* ------------------------------------------------------------------ */
+/* Keystreams + PBOTP v1 container.                                    */
+/* ------------------------------------------------------------------ */function randomBytes(n){const b=new Uint8Array(n);let o=0;while(o<n){const c=new Uint8Array(Math.min(65536,n-o));crypto.getRandomValues(c);b.set(c,o);o+=c.length}return b}
+function concatBytes(list){let n=0;for(const x of list)n+=x.length;const o=new Uint8Array(n);let p=0;for(const x of list){o.set(x,p);p+=x.length}return o}
+function u32le(x){return new Uint8Array([x&255,(x>>>8)&255,(x>>>16)&255,(x>>>24)&255])}
+function readU32le(b,o){return (b[o]|(b[o+1]<<8)|(b[o+2]<<16)|(b[o+3]<<24))>>>0}
+function passwordKS(password,salt,len){
+  const pwB=new TextEncoder().encode(password),blocks=[];
+  const per=(len+31)>>5;
+  for(let i=0;i<per;i++)blocks.push(sha256(concatBytes([salt,pwB,u32le(i)])));
+  return concatBytes(blocks).subarray(0,len);
+}
+function keystreamFor(flags,pad,password,salt,len){
+  if(flags&1)return passwordKS(password,salt,len);
+  if(!pad||pad.length<len)throw new Error('pad shorter than payload');
+  return pad.subarray(0,len);
+}
+function pbEncrypt(payloadBytes,{pad,salt,password,deflateFlag}){
+  /* compress only when it actually helps: incompressible input keeps deflateFlag off */
+  let body=payloadBytes,usedDeflate=false;
+  if(deflateFlag){const c=deflate(payloadBytes);if(c.length<payloadBytes.length){body=c;usedDeflate=true}}
+  const otp=pad!=null;
+  if(otp&&pad.length<body.length)throw new Error('pad shorter than payload');
+  let ks;
+  if(otp)ks=pad.subarray(0,body.length);
+  else ks=passwordKS(password,salt,body.length);
+  const ct=new Uint8Array(body.length);
+  for(let i=0;i<body.length;i++)ct[i]=body[i]^ks[i];
+  const tag=sha256(body).subarray(0,4);
+  const flags=(usedDeflate?2:0)|(otp?0:1);
+  return concatBytes([new Uint8Array([0x50,0x42,0x01,flags]),u32le(body.length),tag,salt||new Uint8Array(8),ct]);
+}
+function pbDecodeContainer(arr,key){
+  if(arr.length<20)return{error:'container too short'};
+  if(!(arr[0]===0x50&&arr[1]===0x42))return{error:'not a PBOTP container'};
+  if(arr[2]!==1)return{error:'unsupported PBOTP version '+arr[2]};
+  const flags=arr[3],payloadLen=readU32le(arr,4);
+  const tag=arr.subarray(8,12),salt=arr.subarray(12,20),ct=arr.subarray(20);
+  if(ct.length!==payloadLen)return{error:'length mismatch'};
+  if(key==null||(typeof key==='string'? !key:key.length===0))return{error:(flags&1)?'missing password':'missing pad'};
+  let body;
+  try{body=keystreamFor(flags,(flags&1)?null:key,(flags&1)?key:null,salt,payloadLen)}
+  catch(e){return{error:e.message}}
+  const payload=new Uint8Array(payloadLen);
+  for(let i=0;i<payloadLen;i++)payload[i]=ct[i]^body[i];
+  const want=sha256(payload).subarray(0,4);
+  for(let i=0;i<4;i++)if(tag[i]!==want[i])return{error:'tag mismatch — wrong key or corrupted container'};
+  if(flags&2){try{return{data:inflate(payload,1<<24)}}catch(e){return{error:'inflate failed: '+e.message}}}
+  return{data:payload};
+}
+function guessText(u8){
+  for(let i=0;i<Math.min(u8.length,4096);i++){const b=u8[i];if(b===0||(b<9)||(b===12)||(b>13&&b<32))return null}
+  try{return new TextDecoder('utf-8',{fatal:true}).decode(u8)}catch(e){return null}
+}
+
+/* ------------------------------------------------------------------ */
+/* UI wiring.                                                          */
+/* ------------------------------------------------------------------ */
+const $=s=>document.querySelector(s);
+function dl(name,data,mime){const a=document.createElement('a');a.href=URL.createObjectURL(new Blob([data],{type:mime||'application/octet-stream'}));a.download=name;a.click();setTimeout(()=>URL.revokeObjectURL(a.href),4000)}
+let encBlob=null,encFileBytes=null,encFileName='';
+function runEncrypt(bytes,tag){
+  const otp=$('#kmode').value==='otp';
+  const wantDef=$('#cmp').checked;
+  /* decide the body first so the pad length exactly matches what pbEncrypt encrypts */
+  let body=bytes,usedDef=false;
+  if(wantDef){const c=deflate(bytes);if(c.length<bytes.length){body=c;usedDef=true}}
+  if(otp){
+    const pad=randomBytes(body.length);
+    const arr=pbEncrypt(bytes,{pad,salt:null,password:null,deflateFlag:usedDef});
+    encBlob=arr;
+    const padStr=b32e(pad);
+    const po=$('#padOut');po.style.display='block';
+    po.textContent='PAD — '+pad.length+' bytes, base32, '+padStr.length+' characters. Shown once. Copy it now.'+'\n'+padStr;
+    $('#ct').value=b32e(arr);
+    $('#encInfo').textContent=bytes.length+' B'+(usedDef?' → deflate '+body.length+' B':' (incompressible: stored)')+' → container '+arr.length+' B ('+b32e(arr).length+' base32 chars)';
+  }else{
+    const pwv=$('#pw').value;
+    if(!pwv){$('#encInfo').textContent='password mode needs a password';return}
+    const salt=randomBytes(8);
+    const arr=pbEncrypt(bytes,{pad:null,salt,password:pwv,deflateFlag:usedDef});
+    encBlob=arr;$('#padOut').style.display='none';
+    $('#ct').value=b32e(arr);
+    $('#encInfo').textContent=bytes.length+' B → container '+arr.length+' B · password stream (not perfect secrecy)';
+  }
+}
+$('#bEncTxt').onclick=()=>runEncrypt(new TextEncoder().encode($('#plain').value),'text');
+$('#fin').addEventListener('change',async e=>{const f=e.target.files[0];if(!f)return;encFileBytes=new Uint8Array(await f.arrayBuffer());encFileName=f.name;$('#fileInfo').textContent='loaded '+f.name+' ('+f.size+' B)'});
+$('#bEncFile').onclick=()=>{if(!encFileBytes){$('#fileInfo').textContent='load a file first';return}runEncrypt(encFileBytes,'file')};
+$('#bCtDl').onclick=()=>{if(encBlob)dl('payload.pbotp',encBlob)};
+$('#bDec').onclick=()=>{
+  const arr=b32d($('#ctIn').value.toUpperCase().replace(/[^A-Z2-7]/g,''));
+  if(!arr||arr.length<20){$('#decInfo').textContent='container unreadable (invalid base32?)';$('#decInfo').className='err';return}
+  const isPwd=!!(arr[3]&1);
+  const key=isPwd?$('#pw2').value:b32d($('#padIn').value.toUpperCase().replace(/[^A-Z2-7]/g,''));
+  const r=pbDecodeContainer(arr,key);
+  if(r.error){$('#decInfo').textContent=r.error;$('#decInfo').className='err';$('#decOut').value='';return}
+  window.__PBDATA=r.data;
+  const t=guessText(r.data);
+  $('#decOut').value=t!==null?t:'(binary — '+r.data.length+' bytes, use Download decrypted bytes)';
+  $('#decInfo').textContent='ok · '+r.data.length+' bytes'+(t===null?' (binary)':'');
+  $('#decInfo').className='ok';
+};
+$('#bDecDl').onclick=()=>{if(window.__PBDATA)dl('decrypted.bin',window.__PBDATA)};
+
+/* ------------------------------------------------------------------ */
+/* Self-test.                                                          */
+/* ------------------------------------------------------------------ */
+const hex=b=>[...b].map(x=>x.toString(16).padStart(2,'0')).join('');
+const eq=(a,b)=>a.length===b.length&&[...a].every((v,i)=>v===b[i]);
+function runTests(){
+  const T=new TextEncoder();
+  const log=[];let pass=0,fail=0;
+  const ok=(c,m)=>{c?pass++:fail++;log.push((c?'ok   ':'FAIL ')+m)};
+  ok(hex(sha256(T.encode('')))==='e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855','sha256 empty string');
+  ok(hex(sha256(T.encode('abc')))==='ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad','sha256 "abc"');
+  ok(hex(sha256(T.encode('abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq')))==='248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1','sha256 448-bit vector');
+  ok(b32e(T.encode('foobar'))==='MZXW6YTBOI','base32 foobar RFC4648 vector');
+  const samples=[
+    ['repeated byte 20k',new Uint8Array(20000).fill(97)],
+    ['prose 2.4k',(()=>{const s='The library contains every image, and every image contains the library. ';let v='';for(let i=0;i<40;i++)v+=s;return T.encode(v)})()],
+    ['random 4k',randomBytes(4096)],
+    ['unicode',T.encode('日本語とEmoji 🎉 π² '.repeat(500))],
+    ['zeros 10k',new Uint8Array(10000)],
+  ];
+  for(const[name,b]of samples){
+    let infOk=false,szOk=false;
+    try{const d=deflate(b);infOk=eq(inflate(d,b.length+64),b);szOk=d.length<=b.length+64}catch(e){}
+    ok(infOk&&szOk,'deflate round-trip: '+name);
+  }
+  ok(deflate(T.encode('aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa')).length<24,'deflate shrinks repeated text');
+  if(typeof V_FIXED!=='undefined'){
+    ok(eq(inflate(V_FIXED,1000),T.encode('hello hello hello hello hello hello')),'inflate zlib fixed-block stream');
+    ok(eq(inflate(V_STORED,1000),T.encode('stored test content here')),'inflate zlib stored-block stream');
+    ok(eq(inflate(V_DYN,7000),dynPlaintext()),'inflate zlib dynamic-block stream (6000 B)');
+  }else ok(false,'zlib reference vectors missing');
+  const msgBytes=T.encode('round-trip: π, ☕, \u{1f600}, tab\tnewline and digits 9876543210 + symbols !"#$%&');
+  {
+    const arr=pbEncrypt(msgBytes,{pad:null,salt:randomBytes(8),password:'pw1',deflateFlag:true});
+    ok(eq(pbDecodeContainer(arr,'pw1').data,msgBytes),'password stream round-trip');
+    const bad=pbDecodeContainer(arr,'pw2');
+    ok(bad.error&&/tag mismatch/.test(bad.error),'wrong password rejected');
+    ok(pbDecodeContainer(arr,'').error!==undefined,'empty password refused');
+  }
+  {
+    const comp=deflate(msgBytes);
+    const pad=randomBytes(comp.length);
+    const arr=pbEncrypt(msgBytes,{pad,salt:null,password:null,deflateFlag:true});
+    ok(eq(pbDecodeContainer(arr,pad).data,msgBytes),'OTP round-trip, compressed');
+    ok(pbDecodeContainer(arr,randomBytes(comp.length)).error&&/tag/.test(pbDecodeContainer(arr,randomBytes(comp.length)).error),'wrong pad rejected');
+    ok(pbDecodeContainer(arr.subarray(0,arr.length-1),pad).error!==undefined,'truncated container refused');
+    const flip=arr.slice();flip[24]^=0x08;
+    ok(pbDecodeContainer(flip,pad).error!==undefined,'single bit flip refused');
+    let threw=false;try{pbEncrypt(msgBytes,{pad:randomBytes(4),salt:null,password:null,deflateFlag:false})}catch(e){threw=/pad shorter/.test(e.message)}
+    ok(threw,'pad shorter than payload refused');
+  }
+  {
+    const pad=randomBytes(200);
+    const arr=pbEncrypt(new Uint8Array(200),{pad,salt:null,password:null,deflateFlag:false});
+    const dec=pbDecodeContainer(arr,pad);
+    ok(!dec.error&&dec.data.length===200&&dec.data.every(v=>v===0),'OTP uncompressed round-trip');
+    ok(deflate(arr).length>=arr.length,'encrypted random data does not compress');
+  }
+  $('#testSum').textContent='self-test '+pass+' pass / '+fail+' fail';
+  $('#testSum').className=fail?'err':'ok';
+  $('#testLog').textContent=log.join('\n');
+  window.__OTEST={pass,fail,lines:log.filter(l=>l.startsWith('FAIL'))};
+  return window.__OTEST;
+}
+$('#bTest').onclick=runTests;
+if(location.search.includes('test=1'))runTests();
+</script>
+</body>
+</html>
