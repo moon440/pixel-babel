@@ -1,0 +1,950 @@
+<!doctype html>
+<!--
+  Pixel Babel v1 — a Library of Babel for pixel images.
+  Copyright (C) 2026 moon440
+  SPDX-License-Identifier: AGPL-3.0-or-later
+
+  This program is free software: you can redistribute it and/or modify it under
+  the terms of the GNU Affero General Public License as published by the Free
+  Software Foundation, either version 3 of the License, or (at your option) any
+  later version. See the file LICENSE for the full text. This page is intended
+  for network use; under section 13 of that license, a modified version made
+  available over a network must also offer its source.
+
+  The algorithm is the reversible-index method of libraryofbabel.app
+  (github.com/tdjsnelling/babel), applied to pixel images:
+    L = w*w pixels, each a palette index 0..15, so a page is a base-16 value V.
+    N = 16^L - 1
+    C = first odd number >= 0x9E3779B97F4A7C15 coprime to N
+    I = modular multiplicative inverse of C mod N (extended Euclid)
+    READ  (address -> image): value = (C * index) mod N; the hex digits of value are the pixels
+    FIND  (image -> address): index = (I * value) mod N
+  Address string = base32(index as L/2 bytes, RFC4648 alphabet, no padding)
+                   + base32(CRC32 of those bytes).
+
+  Single file, no dependencies. The pixel codec (expand/compact) runs as WASM
+  built at runtime from opcodes in this file; base32, CRC32 and the modular math
+  run in plain JS. Both engines produce identical addresses.
+  Self-tests: open index.html?test=1 or press "Run self-tests".
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Pixel Babel — the Library of Babel for images</title>
+<style>
+  :root{--bg:#0d0f12;--fg:#d8dee4;--dim:#8b949e;--acc:#e8b84b;--card:#15181d;--line:#2a2f37;--err:#f05d5d;--ok:#4ac26b}
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.5 ui-monospace,Consolas,"Cascadia Mono",monospace}
+  header{padding:14px 20px;border-bottom:1px solid var(--line);display:flex;gap:14px;align-items:baseline;flex-wrap:wrap}
+  header h1{margin:0;font-size:18px;color:var(--acc);letter-spacing:1px}
+  header .sub{color:var(--dim)}
+  main{display:grid;grid-template-columns:640px 1fr;gap:16px;padding:16px 20px;max-width:1500px}
+  @media(max-width:1100px){main{grid-template-columns:1fr}}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:6px;padding:12px 14px;margin-bottom:14px}
+  .card h2{margin:0 0 8px;font-size:13px;color:var(--acc);text-transform:uppercase;letter-spacing:2px}
+  textarea{width:100%;background:#0a0c0f;color:#9fd356;border:1px solid var(--line);border-radius:4px;padding:8px;font:12px/1.45 inherit;resize:vertical}
+  button,select,input[type=file]{background:#22262d;color:var(--fg);border:1px solid var(--line);border-radius:4px;padding:6px 11px;font:inherit;cursor:pointer}
+  button:hover{border-color:var(--acc)}
+  .row{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin:8px 0}
+  canvas{image-rendering:pixelated;border:1px solid var(--line);background:#000}
+  #palette{display:flex;gap:0;margin:8px 0}
+  #palette div{width:28px;height:28px;border:2px solid transparent;cursor:pointer}
+  #palette div.sel{border-color:#fff;outline:1px solid var(--acc)}
+  pre{white-space:pre-wrap;word-break:break-all;background:#0a0c0f;border:1px solid var(--line);border-radius:4px;padding:8px;font-size:12px;margin:8px 0}
+  .dim{color:var(--dim)} .err{color:var(--err)} .ok{color:var(--ok)} .msg{color:#9fd356}
+  .tag{border:1px solid var(--line);border-radius:4px;padding:2px 8px;font-size:12px;color:var(--dim)}
+  .big{font-size:16px}
+  a{color:var(--acc)}
+  label{color:var(--dim)}
+  .grid-note{font-size:12px;color:var(--dim)}
+  footer{padding:10px 20px;border-top:1px solid var(--line);color:var(--dim);font-size:12px}
+</style>
+</head>
+<body>
+<header>
+  <h1>PIXEL BABEL <span style="font-size:12px">v1</span></h1>
+  <span class="sub">Library of Babel for pixel images · addresses are base32 index plus CRC32 · decode needs no database or server</span>
+  <span class="tag" id="engineTag">engine: …</span>
+  <span class="tag">AGPL-3.0-or-later</span>
+</header>
+
+<main>
+<div><!-- LEFT: the page -->
+  <div class="card">
+    <h2>Address (the small data string)</h2>
+    <textarea id="addrBox" rows="5" spellcheck="false" placeholder="paste an address (base32 + checksum) and press Show…"></textarea>
+    <div class="row">
+      <button id="btnShow">Show page</button>
+      <button id="btnRandom">Random page</button>
+      <button id="btnCopy">Copy</button>
+      <select id="sizeSel" title="size used for new pages">
+        <option value="8">thumbnail 8×8 (59-char address)</option>
+        <option value="16" selected>medallion 16×16 (212-char address)</option>
+        <option value="32">plate 32×32 (827-char address)</option>
+      </select>
+      <span id="pageErr" class="err"></span>
+    </div>
+    <div class="grid-note">Every image of the chosen size has one address, except the all-white page (see boundary case below). READ computes value = (C·index) mod N; the hex digits of value are the pixels.</div>
+  </div>
+
+  <div class="card">
+    <h2>The page</h2>
+    <canvas id="view" width="320" height="320"></canvas>
+    <div id="pageInfo" class="dim"></div>
+    <div class="row"><label>pixel data as hex (the raw archive bytes):</label></div>
+    <pre id="hexDump" style="max-height:150px;overflow:auto"></pre>
+    <div id="msgOut" class="msg big"></div>
+  </div>
+
+  <div class="card">
+    <h2>Exhibit (download and re-find)</h2>
+    <div class="row">
+      <button id="btnPng" title="PNG carries the address in tEXt metadata; its pixels are the exhibit">Download exhibit PNG</button>
+      <button id="btnTxt">Download address .txt</button>
+      <button id="btnExhibit">Download standalone exhibit page</button>
+      <select id="upMode" title="how an uploaded file becomes a library page">
+        <option value="preview">Colour preview (lossy image)</option>
+        <option value="archive">Lossless archive (exact bytes)</option>
+      </select>
+      <label class="dim" style="font-size:12px"><input type="checkbox" id="ditherChk" checked> dither</label>
+      <input type="file" id="fileIn" accept="image/*,*/*" style="max-width:240px">
+      <span id="loadInfo" class="dim"></span>
+    </div>
+    <div class="grid-note">Two modes. <b>Colour preview</b>: rescale the image to the page and map it to the 16 palette colours. Lossy — a page of pixels holds only L*4 bits of colour. <b>Lossless archive</b>: store the file's bytes in the page bytes, chained across pages when large; download restores the original bytes and checks CRC32. Both modes run the same read/find code.</div>
+    <div class="row" style="margin-top:8px">
+      <button id="btnArchDl">Download archived file</button>
+      <button id="btnArchRestore">Restore from pasted addresses</button>
+      <span id="archNote" class="dim"></span>
+    </div>
+    <textarea id="archBox" rows="3" spellcheck="false" placeholder="Lossless archive addresses appear here, one per page, in order. Keep them together; the set is the file." style="font-size:11px"></textarea>
+    <textarea id="archIn" rows="2" spellcheck="false" placeholder="Paste archive address(es) here to rebuild + verify the original file" style="font-size:11px"></textarea>
+  </div>
+
+  <div class="card">
+    <h2>Paint a page, then find its address</h2>
+    <div id="palette"></div>
+    <div class="row">
+      <button id="btnBlank" title="start a fresh solid page">New blank page</button>
+      <button id="btnFill" title="fill the whole page with the selected colour">Fill page with colour</button>
+      <button id="btnNoise">Random paint</button>
+      <label style="margin-left:6px">paint colours:</label>
+      <input type="checkbox" id="paintChk" checked>
+      <button id="btnFind">Find address of this page</button>
+      <span id="paintInfo" class="dim"></span>
+    </div>
+    <div class="grid-note">Pick a colour from the strip, then click the page to paint. <b>New blank page</b> clears the canvas to one colour. <b>Find address</b> runs the codec backwards over your pixels.</div>
+    <pre id="findOut" style="max-height:110px;overflow:auto"></pre>
+  </div>
+
+  <div class="card">
+    <h2>Write any text into the library</h2>
+    <div class="row">
+      <input type="text" id="msgIn" placeholder="text to store in a page (UTF-8)" style="flex:1;min-width:260px;background:#0a0c0f;color:var(--fg);border:1px solid var(--line);border-radius:4px;padding:6px;font:inherit">
+      <button id="btnEmbed">Embed → address</button>
+    </div>
+    <div class="grid-note">The text is hidden in the pixel bytes of a chosen page (magic B1 BE + length + UTF-8). The address of that page will always show it. Nothing is stored. The text is found by scanning the pixel bytes of the page the address decodes to.</div>
+  </div>
+</div>
+
+<div><!-- RIGHT: engine + proof + theory -->
+  <div class="card">
+    <h2>Self-test</h2>
+    <div class="row"><button id="btnTest">Run self-tests</button><span id="testSum" class="big"></span></div>
+    <pre id="testLog" style="max-height:320px;overflow:auto"></pre>
+    <div class="grid-note">Also runs automatically with <b>?test=1</b>. Compares the WASM expand/compact against the JS reference, round-trips addresses and images for all sizes, checks the bijection math (C·I ≡ 1 mod N), CRC32 and base32 vectors, embeds and reads messages, encodes and decodes an exhibit PNG and re-derives its address.</div>
+  </div>
+
+  <div class="card">
+    <h2>How libraryofbabel.app works</h2>
+    <div id="theory" style="font-size:13px">
+      <p><b>libraryofbabel.app</b> — open source at <a href="https://github.com/tdjsnelling/babel">github.com/tdjsnelling/babel</a> (GPL-3.0). A book is 1,312,000 characters from a 32-symbol alphabet. Constants: <b>N = 32<sup>1312000</sup> − 1</b> (written in the README exactly as the all-digit number <code>vvvv…v</code>), <b>C</b> a random number coprime to N, <b>I = C⁻¹ mod N</b> found with the extended Euclidean algorithm. Every book gets a sequential <b>index</b> from its address (room·wall·shelf·book·page).</p>
+      <p>Generate: <b>value = (C·index) mod N</b>. Write value in base-32 with 1,312,000 digits; digit i → alphabet character i. That is the book's text.</p>
+      <p>Search: the same codec backwards. Text → base-32 digits → value; <b>index = (I·value) mod N</b>; index → room/wall/shelf/book/page. Because gcd(C,N)=1, multiplication by C is a <b>bijection</b> mod N, so each index maps to one text and each text maps back to one index. In babel.ts this is <code>mpz_mul</code> by C then <code>mpz_mod</code> for generate, and the same pair with I for search.</p>
+      <p><b>libraryofbabel.info</b> (Jonathan Basile) uses a different invertible map: a linear congruential step <code>x = (a·x + c) mod m</code> (a⁻¹ again from extended Euclid, Hull–Dobell conditions for the parameters) plus Mersenne-style bit tempering whose shifts are undone in reverse order. Source: <a href="https://github.com/librarianofbabel/libraryofbabel.info-algo">github.com/librarianofbabel/libraryofbabel.info-algo</a> (CC BY-NC-SA, a non-commercial license; the algorithm is described here, no code from that repository is reproduced).</p>
+      <p><b>Pixel Babel (this file)</b> applies the same system to images. Alphabet = 16 palette colors, so a w×w page is L = w² base-16 digits = one number V. N = 16<sup>L</sup> − 1, C is the first odd integer ≥ 0x9E3779B97F4A7C15 coprime to N, I = C⁻¹ mod N (extended Euclid, plain BigInt; a few milliseconds in the browser). The <b>address string</b> is the index in base32 (RFC4648 alphabet, no padding), fixed width, plus 7 checksum characters (base32 of CRC32 over the index bytes). Length: 59 / 212 / 827 characters for 8×8 / 16×16 / 32×32. Download runs FIND, show runs READ; one codec.</p>
+      <p>Boundary case, shared with the reference implementations, which also lose one book: value V = N (every digit 15, the pure-white page) maps to index (I·N) mod N = 0, outside the 1…N range, so the all-white page has no address. Every other page — 16<sup>L</sup> − 1 of them — exists exactly once. The self-test checks this.</p>
+      <p><b>Address guessing.</b> The codec is bijective, so two different images always give two different addresses. Blind-guessing one specific page: 8×8 = 1 in 16<sup>64</sup> ≈ 10<sup>77</sup>; 16×16 ≈ 10<sup>308</sup>; 32×32 ≈ 10<sup>1233</sup>. The codec is deterministic: the same image always produces the same address.</p>
+      <p><b>Secret messages.</b> A page is L×4 bits. Those bits can be read as colour indices (an image) or as raw data (a message or file); same bytes, same address. The text feature hides UTF-8 behind a B1&nbsp;BE magic. The lossless archive stores any file's bytes behind a BA&nbsp;CB header, chained across pages with a CRC32, so download restores the original bytes. No server holds any data; the address and this file are enough to recover the page. Anyone with the address and this file can read it, so encrypt before embedding if you need secrecy, or use your own header so the magic is not obvious.</p>
+      <p><b>Quality of uploaded images.</b> A colour page shows 16 fixed colours on w×w pixels. The colour round trip is exact; the loss comes from mapping a many-colour photo to 16 colours on a small grid (measured: about 16 dB PSNR at 32×32, per-pixel). Two options, neither changes the bijection: (1) <b>Dither</b> (Floyd–Steinberg) trades flat colour bands for grain that averages to the true colour; reduces banding by about 3× and the output is still one valid page. (2) <b>Lossless archive mode</b> stores the file's real bytes instead of colour, so the download is bit-perfect and CRC-verified; large files chain over pages. Both use the same read/find code.</p>
+      <p>The pixel codec (expand/compact) runs as <b>WASM</b> built at runtime from opcodes in this file and is checked against a pure-JS reference on load; base32, CRC32 and the modular math run in JS for both engines. Addresses are identical either way. Single file, no dependencies. Pages from 8×8 to 32×32.</p>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>Format spec (v1)</h2>
+    <pre>SIZES        8×8, 16×16, 32×32 · 16-color EGA palette (index 15 = #FFFFFF)
+PIXEL BYTES  byte k holds pixels 2k (high nibble, left) and 2k+1 (low nibble)
+PAGE VALUE V = big-endian integer of pixel bytes · N = 16^L − 1
+INDEX A      in 1..N · READ: V = (C·A) mod N · FIND: A = (I·V) mod N
+C            first odd ≥ 0x9E3779B97F4A7C15 with gcd(C,N)=1; I via extended Euclid
+ADDRESS      base32( A as L/2 big-endian bytes , no padding ) + base32( CRC32(A) as 4 bytes )
+             = 59 / 212 / 827 chars for 8 / 16 / 32. Case-insensitive; spaces . - ignored.
+MESSAGE      pixel bytes at offset o: B1 BE len16BE UTF-8 — located by scanning the bytes
+EXHIBIT PNG  color-type 3, depth 4, PLTE = palette, tEXt "Address"; pixels+address in one file</pre>
+  </div>
+</div>
+</main>
+
+<footer>Pixel Babel v1 · image archive addressed by a pasteable string · license: AGPL-3.0-or-later (see LICENSE). This file can itself be archived as an exhibit.</footer>
+
+<script>
+'use strict';
+/* ------------------------------------------------------------------ */
+/* Reference (pure JS) codec — the specification. WASM below mirrors  */
+/* these functions exactly; the self-test compares them byte-for-byte.*/
+/* ------------------------------------------------------------------ */
+const B32A = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
+const B32R = (()=>{const m={};for(let i=0;i<32;i++)m[B32A[i]]=i;return m})();
+const PAL = ['000000','800000','008000','808000','000080','800080','008080','c0c0c0',
+             '808080','ff0000','00ff00','ffff00','0000ff','ff00ff','00ffff','ffffff']
+            .map(h=>[parseInt(h.slice(0,2),16),parseInt(h.slice(2,4),16),parseInt(h.slice(4,6),16)]);
+
+function expandRef(b){const o=new Uint8Array(b.length*2);for(let i=0;i<b.length;i++){o[2*i]=b[i]>>4;o[2*i+1]=b[i]&15}return o}
+function compactRef(x){const o=new Uint8Array(x.length>>1);for(let i=0;i<o.length;i++)o[i]=((x[2*i]<<4)|x[2*i+1])&255;return o}
+function b32eRef(b){let acc=0,bits=0,s='';for(let i=0;i<b.length;i++){acc=((acc<<8)|b[i])>>>0;bits+=8;while(bits>=5){bits-=5;s+=B32A[(acc>>>bits)&31];}}if(bits>0)s+=B32A[(acc<<(5-bits))&31];return s}
+function b32dRef(str){let acc=0,bits=0;const out=[];for(let i=0;i<str.length;i++){const c=str[i];const v=B32R[c];if(v===undefined)return null;acc=((acc<<5)|v)>>>0;bits+=5;if(bits>=8){bits-=8;out.push((acc>>>bits)&255);}}return new Uint8Array(out)}
+function crcRef(b){let c=0xFFFFFFFF;for(let i=0;i<b.length;i++){c=(c^b[i])>>>0;for(let k=0;k<8;k++)c=((c>>>1)^(0xEDB88320&(-(c&1))))>>>0}return (c^0xFFFFFFFF)>>>0}
+
+/* ------------------------------------------------------------------ */
+/* WASM core: built at runtime from raw opcodes. Same semantics.      */
+/* ------------------------------------------------------------------ */
+function uleb(n){const o=[];do{let b=n&127;n>>>=7;if(n)b|=128;o.push(b)}while(n);return o}
+function sleb(n){n|=0;const o=[];for(;;){let b=n&127;n>>=7;const s=b&64;if((n===0&&!s)||(n===-1&&s)){o.push(b);break}o.push(b|128)}return o}
+function buildWasmBytes(){
+  const END=[0x0B],VOID=0x40,I32T=0x7F;
+  const L=i=>[0x20,...uleb(i)],S=i=>[0x21,...uleb(i)],Cn=n=>[0x41,...sleb(n)];
+  const ADD=[0x6A],MUL=[0x6C],AND=[0x71],OR=[0x72],SHL=[0x74],SHR=[0x76];
+  const GEU=[0x4F];
+  const LD8=off=>[0x2D,0x00,...uleb(off)],ST8=off=>[0x3A,0x00,...uleb(off)];
+  const BLK=bt=>[0x02,bt],LP=bt=>[0x03,bt],IF=bt=>[0x04,bt];
+  const BR=d=>[0x0C,...uleb(d)];
+  const cat=(...a)=>[].concat(...a);
+
+  /* expand(in,len,out): out[2i]=in[i]>>4 ; out[2i+1]=in[i]&15 ; locals i3 b4 */
+  const fExpand=cat(
+    BLK(VOID),LP(VOID),
+      L(3),L(1),GEU,IF(VOID),BR(2),END,
+      L(0),L(3),ADD,LD8(0),S(4),
+      L(2),L(3),Cn(2),MUL,ADD, L(4),Cn(4),SHR,ST8(0),
+      L(2),L(3),Cn(2),MUL,ADD,Cn(1),ADD, L(4),Cn(15),AND,ST8(0),
+      L(3),Cn(1),ADD,S(3),BR(0),
+    END,END);
+  /* compact(in,nb,out): out[i]=(in[2i]<<4)|in[2i+1] ; runs n/2 times ; locals i3 */
+  const fCompact=cat(
+    BLK(VOID),LP(VOID),
+      L(3),L(1),Cn(1),SHR,GEU,IF(VOID),BR(2),END,
+      L(2),L(3),ADD,
+        L(0),L(3),Cn(2),MUL,ADD,LD8(0),Cn(4),SHL,
+        L(0),L(3),Cn(2),MUL,ADD,Cn(1),ADD,LD8(0),
+        OR,
+      ST8(0),
+      L(3),Cn(1),ADD,S(3),BR(0),
+    END,END);
+
+  const bodies=[{locals:2,instr:fExpand},{locals:1,instr:fCompact}];
+  const sec=(id,body)=>[id,...uleb(body.length),...body];
+  const mod=[];
+  mod.push(0x00,0x61,0x73,0x6d,0x01,0x00,0x00,0x00);
+  mod.push(...sec(1,[0x01, 0x60,0x03,I32T,I32T,I32T,0x00]));
+  mod.push(...sec(3,[0x02,0x00,0x00]));
+  mod.push(...sec(5,[0x01,0x00,0x01])); /* 1 page = 64KB */
+  const exp=(name,idx,kind)=>{const nb=[...name].map(c=>c.charCodeAt(0));return [...uleb(nb.length),...nb,kind,...uleb(idx)]};
+  mod.push(...sec(7,[0x03, ...exp('expand',0,0),...exp('compact',1,0),...exp('memory',0,2)]));
+  const codeBody=[];codeBody.push(...uleb(bodies.length));
+  for(const b of bodies){
+    const inner=b.locals>0?[...uleb(1),...uleb(b.locals),I32T]:uleb(0);
+    const body=[...inner,...b.instr,...END];
+    codeBody.push(...uleb(body.length),...body);
+  }
+  mod.push(...sec(10,codeBody));
+  return new Uint8Array(mod);
+}
+
+/* WASM memory arena (within page 0): 0=alphabet,64=rmap,0x2000=input,0x8000=output */
+const IN=0x2000,OUT=0x8000;
+function makeWasmEngine(){
+  const inst=new WebAssembly.Instance(new WebAssembly.Module(buildWasmBytes()),{});
+  const ex=inst.exports, mem=new Uint8Array(ex.memory.buffer);
+  const take=n=>mem.slice(OUT,OUT+n);
+  const eng={
+    name:'wasm',
+    expand:b=>{mem.set(b,IN);ex.expand(IN,b.length,OUT);return take(b.length*2)},
+    compact:x=>{mem.set(x,IN);const n=x.length>>1;ex.compact(IN,x.length,OUT);return take(n)},
+    /* base32 and CRC32 run in the JS reference; the WASM module exports only
+       expand/compact. Addresses are identical in both engines. */
+    b32e:b=>b32eRef(b),
+    b32d:str=>b32dRef(str),
+    crc:b=>crcRef(b)
+  };
+  /* Self-verify the WASM exports against the JS reference before use. A wrong
+     pixel codec would corrupt every image, so any mismatch discards WASM. */
+  const eq=(x,y)=>x.length===y.length&&[...x].every((v,i)=>v===y[i]);
+  const chk=[];
+  chk.push(eq(eng.expand(Uint8Array.from([0x12,0xab,0xcd])),[1,2,10,11,12,13]));
+  chk.push(eq(eng.compact(Uint8Array.from([1,2,10,11,12,13])),Uint8Array.from([0x12,0xab,0xcd])));
+  for(const len of [1,2,31,32,33,64,128,511,512]){   /* cover all page sizes, not just small */
+    const b=new Uint8Array(len);crypto.getRandomValues(b);
+    chk.push(eq(eng.expand(b),expandRef(b)));
+    const x=new Uint8Array(2*len);crypto.getRandomValues(x);for(let k=0;k<x.length;k++)x[k]&=15;
+    chk.push(eq(eng.compact(x),compactRef(x)));
+  }
+  for(let i=0;i<64;i++){
+    const n=1+Math.floor(Math.random()*512);
+    const b=new Uint8Array(n);crypto.getRandomValues(b);
+    chk.push(eq(eng.expand(b),expandRef(b)));
+    const x=new Uint8Array(2*n);crypto.getRandomValues(x);for(let k=0;k<x.length;k++)x[k]&=15;
+    chk.push(eq(eng.compact(x),compactRef(x)));
+  }
+  if(!chk.every(Boolean))throw new Error('WASM expand/compact failed self-verification ('+chk.filter(Boolean).length+'/'+chk.length+' ok)');
+  return eng;
+}
+const jsEngine={name:'js',expand:expandRef,compact:compactRef,b32e:b32eRef,
+  b32d:s=>b32dRef(s),crc:crcRef};
+let ENG; try{ ENG=makeWasmEngine(); }catch(e){ ENG=jsEngine; console.warn('WASM build failed, using JS engine:',e); }
+
+/* ------------------------------------------------------------------ */
+/* The library itself: bijection math + address format.               */
+/* ------------------------------------------------------------------ */
+const SIZES={8:{name:'thumbnail'},16:{name:'medallion'},32:{name:'plate'}};
+const CHARS_FOR_BYTES={32:52,128:205,512:820};      /* ceil(nbytes*8/5) */
+const BYTES_FOR_CHARS={52:32,205:128,820:512};
+function wForBytes(n){return n===32?8:n===128?16:32}
+
+function gcd(a,b){while(b){[a,b]=[b,a%b]}return a}
+function modinv(a,m){
+  /* iterative extended Euclid (BigInt): returns x with a·x ≡ 1 (mod m) */
+  let or=a%m,r=m,os=1n,s=0n;
+  while(r>0n){
+    const q=or/r;
+    const nr=or-q*r;or=r;r=nr;
+    const ns=os-q*s;os=s;s=ns;
+  }
+  if(or!==1n)throw new Error('no inverse');
+  return((os%m)+m)%m;
+}
+const _kc={};
+function consts(w){
+  if(_kc[w])return _kc[w];
+  const L=w*w; const N=(16n**BigInt(L))-1n;
+  let C=0x9E3779B97F4A7C15n|1n;
+  while(gcd(C,N)!==1n)C+=2n;
+  const I=modinv(C,N);
+  return(_kc[w]={L,N,C,I,nbytes:L/2});
+}
+function bigToFixedBytes(x,n){let h=x.toString(16);if(h.length>n*2)throw new Error('overflow');h=h.padStart(n*2,'0');
+  const b=new Uint8Array(n);for(let i=0;i<n;i++)b[i]=parseInt(h.slice(2*i,2*i+2),16);return b}
+function bytesToBig(b){let h='';for(const x of b)h+=x.toString(16).padStart(2,'0');return BigInt('0x'+(h||'0'))}
+
+function normalizeAddr(str){return str.toUpperCase().replace(/[\s.,\-\/]/g,'')}
+function addrFromIndex(A,w,E){
+  const c=consts(w);
+  const Ab=bigToFixedBytes(A,c.nbytes);
+  const main=E.b32e(Ab);
+  const crc=E.crc(Ab)>>>0;
+  const cb=new Uint8Array([(crc>>>24)&255,(crc>>>16)&255,(crc>>>8)&255,crc&255]);
+  return main+E.b32e(cb);
+}
+function parseAddr(addr,E){
+  const s=normalizeAddr(addr);
+  if(s.length<8)return{error:'address too short'};
+  const main=s.slice(0,s.length-7),tail=s.slice(s.length-7);
+  if(!BYTES_FOR_CHARS[main.length])return{error:'address length matches no page size (52/205/820 + 7 checksum chars)'};
+  const Ab=E.b32d(main);const cb=E.b32d(tail);
+  if(!Ab||!cb)return{error:'invalid characters (base32 A-Z 2-7 only)'};
+  if(cb.length!==4)return{error:'bad checksum length'};
+  const want=E.crc(Ab)>>>0;
+  const got=((cb[0]<<24)|(cb[1]<<16)|(cb[2]<<8)|cb[3])>>>0;
+  if(want!==got)return{error:'checksum mismatch — address has a typo'};
+  const w=wForBytes(Ab.length);
+  const c=consts(w);
+  const A=bytesToBig(Ab);
+  if(A===0n)return{error:'index 0 is not in the library (indices run 1..N)'};
+  if(A>c.N)return{error:'index beyond N'};
+  return{w,A,c,Ab};
+}
+function readPage(addr,E){
+  const p=parseAddr(addr,E);if(p.error)return p;
+  const V=(p.c.C*p.A)%p.c.N;
+  const vb=bigToFixedBytes(V,p.c.nbytes);
+  return{w:p.w,A:p.A,V,vbytes:vb,indices:E.expand(vb),msg:readMsg(vb)};
+}
+function findPage(indices,w,E){
+  const c=consts(w);
+  const vb=E.compact(indices);
+  const V=bytesToBig(vb);
+  if(V===c.N)return{error:'all-white page: value equals N, which has no index in 1..N'};
+  let A=(c.I*V)%c.N;
+  if(A===0n)A=c.N;          /* V=0 (all-black) maps to index N, as on the reference site */
+  return{addr:addrFromIndex(A,w,E),A,V};
+}
+function randomIndex(w){
+  const c=consts(w);
+  const b=new Uint8Array(c.nbytes);crypto.getRandomValues(b);
+  let A=bytesToBig(b)%c.N;if(A===0n)A=c.N;
+  return A;
+}
+/* messages hidden inside the pixel bytes */
+const TD=new TextDecoder('utf-8',{fatal:true});
+function embedText(text,w,E){
+  const msgBytes=[...new TextEncoder().encode(text)];
+  const c=consts(w);
+  if(msgBytes.length>c.nbytes-8)throw new Error('text too long for '+w+'×'+w+' (max '+(c.nbytes-8)+' bytes)');
+  const vb=new Uint8Array(c.nbytes);crypto.getRandomValues(vb);
+  const oMin=4,oMax=c.nbytes-4-msgBytes.length;
+  const r2=crypto.getRandomValues(new Uint8Array(2));
+  const o=oMin+(((r2[0]<<8)|r2[1])%(oMax-oMin+1));
+  for(let i=0;i<vb.length;i++)if((i<o||i>=o+4+msgBytes.length)&&vb[i]===0xB1)vb[i]=0xB0; /* no false magics in filler */
+  vb[o]=0xB1;vb[o+1]=0xBE;vb[o+2]=msgBytes.length>>8;vb[o+3]=msgBytes.length&255;
+  vb.set(msgBytes,o+4);
+  let A=(c.I*bytesToBig(vb))%c.N;
+  let guard=0;
+  while(A===0n){vb[0]^=1;A=(c.I*bytesToBig(vb))%c.N;if(++guard>10)throw new Error('unreachable')}
+  return{addr:addrFromIndex(A,w,E),vbytes:vb};
+}
+function readMsg(vb){
+  for(let i=0;i<vb.length-3;i++){
+    if(vb[i]===0xB1&&vb[i+1]===0xBE){
+      const len=(vb[i+2]<<8)|vb[i+3];
+      if(len>0&&i+4+len<=vb.length){
+        try{const t=TD.decode(vb.slice(i+4,i+4+len));
+          if(t&&!/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/.test(t))return{offset:i,text:t}}catch(e){}
+      }
+    }
+  }
+  return null;
+}
+
+/* ------------------------------------------------------------------ */
+/* Lossless archive: raw bytes stored in the same page bytes that      */
+/* produce the colour. A page is L*4 bits — it can hold (L*4/8 − 14)   */
+/* file bytes exactly, or be chained across pages for any size. The    */
+/* these are ordinary library pages; the bijection is unchanged.       */
+/* Header (14B, always nonzero → never the all-white/all-black edge): */
+/*   BA CB | fragIdx u16 | fragCount u16 | totalLen u32 | crc32 u32    */
+/* ------------------------------------------------------------------ */
+const ARCH_HDR=14;
+function archiveToAddresses(data,w,E){
+  const c=consts(w),cap=c.nbytes-ARCH_HDR;
+  if(cap<=0)throw new Error('page too small to archive');
+  const count=Math.ceil(data.length/cap);
+  if(count===0||count>65535)throw new Error('archive size or fragment count out of range');
+  const crc=crcRef(data)>>>0;
+  const addrs=[];
+  for(let f=0;f<count;f++){
+    const vb=new Uint8Array(c.nbytes);              /* zero padding beyond last chunk */
+    vb[0]=0xBA;vb[1]=0xCB;
+    vb[2]=f>>8&255;vb[3]=f&255;vb[4]=count>>8&255;vb[5]=count&255;
+    vb.set(u32b(data.length),6);vb.set(u32b(crc),10);
+    vb.set(data.subarray(f*cap,Math.min(data.length,(f+1)*cap)),ARCH_HDR);
+    const V=bytesToBig(vb);                         /* header ⇒ V≠0 and V≠N, always in library */
+    let A=(c.I*V)%c.N; if(A===0n)A=c.N;
+    addrs.push(addrFromIndex(A,w,E));
+  }
+  return{addrs,cap,count,crc,total:data.length};
+}
+function archiveRestore(addrs,E){
+  const byIdx=new Map();let count=null,total=null,crc=null,wSeen=null;
+  for(const a of addrs){
+    const p=parseAddr(a,E);if(p.error)return{error:'address rejected: '+p.error};
+    if(wSeen===null)wSeen=p.w;else if(p.w!==wSeen)return{error:'mixed page sizes in one archive'};
+    const c=p.c,V=(c.C*p.A)%c.N,vb=bigToFixedBytes(V,c.nbytes);
+    if(vb[0]!==0xBA||vb[1]!==0xCB)return{error:'not an archive page (use Colour preview to store a picture)'};
+    const idx=(vb[2]<<8)|vb[3],cnt=(vb[4]<<8)|vb[5];
+    if(count===null){count=cnt;total=((vb[6]<<24)|(vb[7]<<16)|(vb[8]<<8)|vb[9])>>>0;crc=((vb[10]<<24)|(vb[11]<<16)|(vb[12]<<8)|vb[13])>>>0;}
+    else if(cnt!==count)return{error:'fragment count mismatch — a page is missing'};
+    if(byIdx.has(idx))return{error:'duplicate fragment '+idx};
+    byIdx.set(idx,vb.subarray(ARCH_HDR));
+  }
+  if(count===null)return{error:'empty archive'};
+  if(byIdx.size!==count)return{error:'have '+byIdx.size+' of '+count+' fragments — archive incomplete'};
+  const cap=consts(wSeen).nbytes-ARCH_HDR;
+  const out=new Uint8Array(count*cap);let off=0;
+  for(let i=0;i<count;i++){const fr=byIdx.get(i);out.set(fr,i*cap);}
+  const data=out.subarray(0,total);
+  if((crcRef(data)>>>0)!==crc)return{error:'CRC mismatch — a fragment is corrupted'};
+  return{data,w:wSeen};
+}
+
+
+/* ------------------------------------------------------------------ */
+/* Exhibit PNG: indexed color, depth 4, tEXt "Address". Pure JS.      */
+/* ------------------------------------------------------------------ */
+function chunk(type,data){
+  const t=[...type].map(c=>c.charCodeAt(0));
+  const body=[...t,...data];
+  const len=data.length;
+  const crc=crcRef(new Uint8Array(body))>>>0;
+  return new Uint8Array([len>>>24&255,len>>>16&255,len>>>8&255,len&255,...body,crc>>>24&255,crc>>>16&255,crc>>>8&255,crc&255]);
+}
+function u32b(x){return new Uint8Array([x>>>24&255,x>>>16&255,x>>>8&255,x&255])}
+function catBytes(list){let n=0;for(const b of list)n+=b.length;const o=new Uint8Array(n);let p=0;for(const b of list){o.set(b,p);p+=b.length}return o}
+function encodeExhibitPng(w,vbytes,addr){
+  const ihdr=new Uint8Array([...u32b(w),...u32b(w),4,3,0,0,0]); /* bit depth 4, color type 3 (indexed) */
+  const plte=new Uint8Array(48);for(let i=0;i<16;i++){plte[3*i]=PAL[i][0];plte[3*i+1]=PAL[i][1];plte[3*i+2]=PAL[i][2]}
+  const raw=new Uint8Array(w*(1+w/2));
+  for(let r=0;r<w;r++){raw[r*(1+w/2)]=0;raw.set(vbytes.subarray(r*w/2,(r+1)*w/2),r*(1+w/2)+1)}
+  /* zlib: 0x78 0x01 + stored deflate block + adler32 */
+  let a=1,b=0;for(const x of raw){a=(a+x)%65521;b=(b+a)%65521}
+  const adler=u32b(((b<<16)|a)>>>0);
+  const defl=new Uint8Array([0x01, raw.length&255,raw.length>>>8&255, ~raw.length&255,~raw.length>>>8&255, ...raw]);
+  const idat=catBytes([new Uint8Array([0x78,0x01]),defl,adler]);
+  const txtAddr=new Uint8Array([...[..."Address"].map(c=>c.charCodeAt(0)),0,...[...addr].map(c=>c.charCodeAt(0))]);
+  const txtSw =new Uint8Array([...[..."Software"].map(c=>c.charCodeAt(0)),0,...[..."PixelBabel v1"].map(c=>c.charCodeAt(0))]);
+  return catBytes([new Uint8Array([137,80,78,71,13,10,26,10]),
+    chunk('IHDR',ihdr),chunk('PLTE',plte),chunk('tEXt',txtAddr),chunk('tEXt',txtSw),
+    chunk('IDAT',idat),chunk('IEND',new Uint8Array(0))]);
+}
+async function decodePng(u8){
+  const dv=new DataView(u8.buffer,u8.byteOffset,u8.length);
+  const SIG=[137,80,78,71,13,10,26,10];for(let i=0;i<8;i++)if(u8[i]!==SIG[i])return{error:'not a PNG'};
+  let p=8;let ihdr=null,plte=null,idat=[],text={};
+  while(p+8<=u8.length){
+    const len=dv.getUint32(p),type=String.fromCharCode(u8[p+4],u8[p+5],u8[p+6],u8[p+7]);
+    const data=u8.subarray(p+8,p+8+len);
+    if(type==='IHDR'){const w=data[0]<<24|data[1]<<16|data[2]<<8|data[3],h=data[4]<<24|data[5]<<16|data[6]<<8|data[7];
+      ihdr={w,h,bd:data[8],ct:data[9],il:data[11]&1}}
+    else if(type==='PLTE')plte=data;
+    else if(type==='IDAT')idat.push(data.slice());
+    else if(type==='tEXt'){const s=new TextDecoder();const z=data.indexOf(0);text[s.decode(data.subarray(0,z))]=s.decode(data.subarray(z+1))}
+    else if(type==='IEND')break;
+    p+=12+len;
+  }
+  if(!ihdr||ihdr.il)return{error:'interlaced PNG unsupported'};
+  const{w,h,bd,ct}=ihdr;
+  if(!(SIZES[w]&&h===w))return{error:'only 8/16/32 square images are library pages'};
+  const comp=catBytes(idat);
+  let raw;
+  if(typeof DecompressionStream!=='undefined'){
+    try{
+      const fmt=comp[0]===0x78?'deflate':'deflate-raw';
+      const ds=new DecompressionStream(fmt);
+      const ab=await new Response(new Blob([comp]).stream().pipeThrough(ds)).arrayBuffer();
+      raw=new Uint8Array(ab);
+    }catch(e){return{error:'PNG decompression failed'}}
+  }else if(comp[0]===0x78&&comp[2]===0x01){raw=comp.subarray(7,comp.length-4)} /* our stored blocks */
+  else return{error:'no decompression available in this browser'};
+  /* unfilter */
+  const chan=ct===0?1:ct===2?3:ct===3?1:ct===6?4:0;
+  if(!chan)return{error:'color type '+ct+' unsupported'};
+  const bppPx=Math.max(1,Math.ceil(chan*bd/8));
+  const rbytes=Math.ceil(w*bd/8);const stride=rbytes+1;
+  if(raw.length<h*stride)return{error:'short IDAT'};
+  const prev=new Uint8Array(rbytes),cur=new Uint8Array(rbytes),out=new Uint8Array(h*rbytes);
+  const paeth=(a,b,c)=>{const p=a+b-c,pa=Math.abs(p-a),pb=Math.abs(p-b),pc=Math.abs(p-c);return pa<=pb&&pa<=pc?a:pb<=pc?b:c};
+  for(let y=0;y<h;y++){
+    const f=raw[y*stride];const src=raw.subarray(y*stride+1,(y+1)*stride);
+    for(let x=0;x<rbytes;x++){
+      const A=x>=bppPx?cur[x-bppPx]:0,B=y>0?prev[x]:0,C=(x>=bppPx&&y>0)?prev[x-bppPx]:0;
+      let v=src[x];
+      if(f===1)v+=A;else if(f===2)v+=B;else if(f===3)v+=(A+B)>>1;else if(f===4)v+=paeth(A,B,C);
+      else if(f!==0)return{error:'unknown filter'};
+      cur[x]=v&255;
+    }
+    out.set(cur,y*rbytes);prev.set(cur);
+  }
+  /* to palette indices */
+  const idx=new Uint8Array(w*h);let exact=true;
+  const mask=(1<<bd)-1;
+  if(ct===3){
+    if(!plte)return{error:'palette PNG missing PLTE'};
+    for(let y=0;y<h;y++)for(let x=0;x<w;x++){
+      const bitpos=y*rbytes*8+x*bd;
+      const v=bd===8?out[y*rbytes+x]:((out[bitpos>>3]>>(8-bd-(bitpos&7)))&mask);
+      idx[y*w+x]=v<plte.length/3?v:0;
+    }
+    if(plte.length<48)exact=false;
+    for(let i=0;i<16;i++)if(plte[3*i]!==PAL[i][0]||plte[3*i+1]!==PAL[i][1]||plte[3*i+2]!==PAL[i][2]){exact=false;break}
+  }else{
+    if(bd!==8||(ct!==0&&ct!==2&&ct!==6))return{error:'non-palette PNG must be 8-bit gray/RGB/RGBA'};
+    for(let y=0;y<h;y++)for(let x=0;x<w;x++){
+      let r,g,bl;
+      if(ct===0){r=g=bl=out[y*w+x]}
+      else{const o=(y*w+x)*chan;r=out[o];g=out[o+1];bl=out[o+2]}
+      let best=0,bd2=Infinity;
+      for(let i=0;i<16;i++){const dr=PAL[i][0]-r,dg=PAL[i][1]-g,db=PAL[i][2]-bl;const d=dr*dr+dg*dg+db*db;if(d<bd2){bd2=d;best=i}}
+      if(bd2!==0)exact=false;
+      idx[y*w+x]=best;
+    }
+  }
+  return{w,h,indices:idx,exact,textAddress:text.Address};
+}
+
+/* ------------------------------------------------------------------ */
+/* Standalone exhibit page generator (mini decoder, no deps)          */
+/* ------------------------------------------------------------------ */
+function buildExhibitHtml(addr){
+  const parts=[expandRef,b32dRef,crcRef,normalizeAddr,bytesToBig,bigToFixedBytes,gcd,modinv,
+    consts,wForBytes,parseAddr,readPage,readMsg];
+  const src=parts.map(f=>f.toString()).join('\n\n');
+  const lines=[
+'<!doctype html><html><head><meta charset="utf-8"><title>Pixel Babel exhibit</title>',
+'<style>body{background:#0d0f12;color:#d8dee4;font:14px monospace;margin:2em}canvas{image-rendering:pixelated;width:320px;height:320px;border:1px solid #444}pre{word-break:break-all;color:#e8b84b;max-width:660px}.m{color:#9fd356;font-size:18px}</style></head><body>',
+'<h2>Pixel Babel — standalone exhibit</h2>',
+'<pre id="a">'+addr+'</pre><canvas id="c"></canvas><div class="m" id="m"></div>',
+'<p>Rendered from the address. The decoder is embedded in this file; no other data is required. License: AGPL-3.0-or-later.</p>',
+'<scr'+'ipt>',
+'"use strict";',
+'const B32A='+JSON.stringify(B32A)+';',
+'const B32R={};for(let i=0;i<32;i++)B32R[B32A[i]]=i;',
+'const PAL='+JSON.stringify(PAL)+';',
+'const BYTES_FOR_CHARS='+JSON.stringify(BYTES_FOR_CHARS)+';',
+'let _kc={};',
+'const TD=new TextDecoder("utf-8",{fatal:true});',
+'const E={expand:expandRef,b32d:b32dRef,crc:crcRef};',
+src,
+'const r=readPage(document.getElementById("a").textContent,E);',
+'if(r.error){document.body.innerHTML+="<p style=\\"color:#f55\\">"+r.error+"</p>"}else{',
+'const c=document.getElementById("c");c.width=r.w;c.height=r.w;const g=c.getContext("2d");const im=g.createImageData(r.w,r.w);',
+'for(let i=0;i<r.indices.length;i++){const p=PAL[r.indices[i]];im.data[4*i]=p[0];im.data[4*i+1]=p[1];im.data[4*i+2]=p[2];im.data[4*i+3]=255}',
+'g.putImageData(im,0,0);',
+'if(r.msg)document.getElementById("m").textContent="message in this page: \\""+r.msg.text+"\\"";}',
+'</scr'+'ipt></body></html>'];
+  return lines.join('\n');
+}
+
+/* ------------------------------------------------------------------ */
+/* UI wiring                                                          */
+/* ------------------------------------------------------------------ */
+const $=s=>document.querySelector(s);
+const view=$('#view'),vctx=view.getContext('2d');
+let pageSize=16,paintBuf=null,paintColor=1,currentAddr='',painting=false;
+function curSize(){return +$('#sizeSel').value}
+function drawIndices(w,idx){
+  const scale=320/w;view.width=320;view.height=320;
+  const off=document.createElement('canvas');off.width=w;off.height=w;
+  const g=off.getContext('2d');const im=g.createImageData(w,w);
+  for(let i=0;i<idx.length;i++){const p=PAL[idx[i]&15];im.data[4*i]=p[0];im.data[4*i+1]=p[1];im.data[4*i+2]=p[2];im.data[4*i+3]=255}
+  g.putImageData(im,0,0);
+  vctx.imageSmoothingEnabled=false;vctx.clearRect(0,0,320,320);vctx.drawImage(off,0,0,w,w,0,0,320,320);
+}
+function hexDump(b){let s='';for(let i=0;i<b.length;i++){s+=b[i].toString(16).padStart(2,'0');s+=i%16===15?'\n':' '}return s}
+function showPage(addr){
+  const r=readPage(addr,ENG);
+  const err=$('#pageErr');err.textContent='';
+  if(r.error){err.textContent=r.error;return}
+  currentAddr=addr;pageSize=r.w;paintBuf=r.indices.slice();
+  drawIndices(r.w,r.indices);
+  $('#addrBox').value=groupAddr(addr);
+  $('#pageInfo').textContent=r.w+'×'+r.w+' page · index = '+r.A.toString(36).slice(0,12)+'… (base36, '+r.A.toString(16).length+' hex digits) · N = 16^'+r.w*r.w+'−1';
+  $('#hexDump').textContent=hexDump(r.vbytes);
+  $('#msgOut').textContent=r.msg?('text in this page: "'+r.msg.text+'"'):'no embedded message';
+}
+function groupAddr(a){return a.replace(/(.{8})(?=.)/g,'$1 ')}
+$('#btnShow').onclick=()=>showPage($('#addrBox').value);
+$('#btnRandom').onclick=()=>{const w=curSize();const A=randomIndex(w);showPage(addrFromIndex(A,w,ENG))};
+$('#btnCopy').onclick=async()=>{try{await navigator.clipboard.writeText(normalizeAddr($('#addrBox').value))}catch(e){}};
+
+/* palette + paint */
+(function buildPalette(){
+  const p=$('#palette');
+  PAL.forEach((c,i)=>{const d=document.createElement('div');d.style.background='#'+c.map(x=>x.toString(16).padStart(2,'0')).join('');
+    d.title='index '+i;d.onclick=()=>{paintColor=i;[...p.children].forEach(x=>x.classList.remove('sel'));d.classList.add('sel')};
+    p.appendChild(d)});
+  p.children[1].classList.add('sel');
+})();
+view.addEventListener('click',e=>{
+  if(!paintBuf){newBlankPage(curSize(),paintColor)}   /* first click starts painting */
+  $('#paintChk').checked=true;
+  const rect=view.getBoundingClientRect();
+  const x=Math.floor((e.clientX-rect.left)/320*pageSize),y=Math.floor((e.clientY-rect.top)/320*pageSize);
+  if(x<0||y<0||x>=pageSize||y>=pageSize)return;
+  paintBuf[y*pageSize+x]=paintColor;
+  drawIndices(pageSize,paintBuf);
+});
+function newBlankPage(w,color){
+  paintBuf=new Uint8Array(w*w).fill(color);pageSize=w;painting=true;
+  drawIndices(w,paintBuf);currentAddr='';$('#findOut').textContent='';
+  $('#paintInfo').textContent=w+'×'+w+' blank (colour '+color+') · click the page to paint, then Find';
+}
+$('#btnBlank').onclick=()=>{newBlankPage(curSize(),paintColor)};
+$('#btnFill').onclick=()=>{
+  if(!paintBuf)newBlankPage(curSize(),paintColor);
+  paintBuf.fill(paintColor);pageSize=curSize();
+  if(paintBuf.length!==pageSize*pageSize){paintBuf=new Uint8Array(pageSize*pageSize).fill(paintColor)}
+  drawIndices(pageSize,paintBuf);$('#paintInfo').textContent='page filled with colour '+paintColor+' · press Find';
+};
+$('#btnNoise').onclick=()=>{const w=curSize();paintBuf=new Uint8Array(w*w);crypto.getRandomValues(paintBuf);
+  for(let i=0;i<paintBuf.length;i++)paintBuf[i]&=15;
+  pageSize=w;drawIndices(w,paintBuf);$('#paintInfo').textContent=w+'×'+w+' painted · press Find'};
+$('#btnFind').onclick=()=>{
+  if(!paintBuf){$('#paintInfo').textContent='paint something first (or Random paint)';return}
+  const r=findPage(paintBuf,pageSize,ENG);
+  $('#paintInfo').textContent='';
+  if(r.error){$('#findOut').textContent='NOT IN LIBRARY: '+r.error;return}
+  currentAddr=r.addr;$('#findOut').textContent=groupAddr(r.addr);
+  showPage(r.addr);
+};
+
+/* text embedding */
+$('#btnEmbed').onclick=()=>{
+  const t=$('#msgIn').value;
+  if(!t){return}
+  try{
+    const r=embedText(t,curSize(),ENG);
+    showPage(r.addr);
+    $('#pageInfo').textContent+=' · embedded message: '+t;
+  }catch(e){$('#pageErr').textContent=e.message}
+};
+
+/* exhibits */
+function dl(name,data,mime){
+  const a=document.createElement('a');a.href=URL.createObjectURL(new Blob([data],{type:mime}));
+  a.download=name;a.click();setTimeout(()=>URL.revokeObjectURL(a.href),4000);
+}
+$('#btnPng').onclick=()=>{
+  if(!currentAddr){$('#loadInfo').textContent='show a page first';return}
+  const r=readPage(currentAddr,ENG);
+  if(r.error){$('#loadInfo').textContent=r.error;return}
+  dl('babelpix-'+r.w+'-'+normalizeAddr(currentAddr).slice(0,16)+'.png',encodeExhibitPng(r.w,r.vbytes,normalizeAddr(currentAddr)),'image/png');
+  $('#loadInfo').textContent='exhibit PNG downloaded (pixels + tEXt "Address")';
+};
+$('#btnTxt').onclick=()=>{
+  if(!currentAddr)return;
+  const r=readPage(currentAddr,ENG);
+  dl('babelpix-address.txt',normalizeAddr(currentAddr)+(r.msg?'\n# embedded message: '+r.msg.text:''),'text/plain');
+};
+$('#btnExhibit').onclick=()=>{
+  if(!currentAddr){$('#loadInfo').textContent='show a page first';return}
+  dl('babelpix-exhibit.html',buildExhibitHtml(normalizeAddr(currentAddr)),'text/html');
+};
+/* map an ImageData (any size) to the nearest of the 16 library colors at target w×w */
+function quantizeToLibrary(imgData,targetW,dither){
+  const src=imgData.width, sh=imgData.height;
+  const off=document.createElement('canvas');off.width=targetW;off.height=targetW;
+  const g=off.getContext('2d');g.imageSmoothingQuality='high';
+  const side=Math.min(src,sh);const cx=(src-side)/2,cy=(sh-side)/2;
+  g.drawImage(canvasFromImageData(imgData),cx,cy,side,side,0,0,targetW,targetW);
+  const px=new Float32Array(g.getImageData(0,0,targetW,targetW).data); /* keep room for error diffusion */
+  const idx=new Uint8Array(targetW*targetW);let worst=0,sumSq=0;
+  const near=(r,gg,b,a)=>{let bi=0,bd=Infinity;
+    for(let k=0;k<16;k++){const dr=PAL[k][0]-r,dg=PAL[k][1]-gg,db=PAL[k][2]-b;let d=dr*dr+dg*dg+db*db;
+      if(a<128)d+=255*255*3;if(d<bd){bd=d;bi=k}}return[bi,bd]};
+  for(let y=0;y<targetW;y++)for(let x=0;x<targetW;x++){
+    const i=(y*targetW+x)*4;const r=px[i],gg=px[i+1],b=px[i+2],a=px[i+3];
+    const [best,bd]=near(r,gg,b,a);
+    if(bd>worst)worst=bd;sumSq+=bd;
+    idx[y*targetW+x]=best;
+    if(!dither)continue;
+    /* Floyd–Steinberg: push the colour the palette can't show into neighbours */
+    const er=r-PAL[best][0],eg2=gg-PAL[best][1],eb=b-PAL[best][2];
+    const spread=[[1,0,7/16],[-1,1,3/16],[0,1,5/16],[1,1,1/16]];
+    for(const[dx,dy,f]of spread){const nx=x+dx,ny=y+dy;if(nx<0||nx>=targetW||ny>=targetW)continue;
+      const j=(ny*targetW+nx)*4;px[j]+=er*f;px[j+1]+=eg2*f;px[j+2]+=eb*f}
+  }
+  const mse=sumSq/(targetW*targetW*3);
+  return{indices:idx,w:targetW,maxDist:Math.sqrt(worst),psnr:mse>0?10*Math.log10(255*255/mse):99};
+}
+function canvasFromImageData(im){
+  const c=document.createElement('canvas');c.width=im.width;c.height=im.height;
+  c.getContext('2d').putImageData(im,0,0);return c;
+}
+async function imageToIndices(file,targetW,dither){
+  const bmp=await createImageBitmap(file);
+  const off=document.createElement('canvas');off.width=bmp.width;off.height=bmp.height;
+  const g=off.getContext('2d');g.drawImage(bmp,0,0);
+  const data=g.getImageData(0,0,bmp.width,bmp.height);
+  bmp.close&&bmp.close();
+  return quantizeToLibrary(data,targetW,dither);
+}
+$('#fileIn').addEventListener('change',async e=>{
+  const f=e.target.files[0];if(!f)return;
+  const el=$('#loadInfo');el.textContent='reading…';
+  const targetW=curSize();
+  const mode=$('#upMode').value;              /* 'preview' (lossy colour) or 'archive' (lossless bytes) */
+  const buf=new Uint8Array(await f.arrayBuffer());
+  if(mode==='archive'){
+    /* lossless: store the exact file bytes in library pages, chained if needed */
+    try{
+      const a=archiveToAddresses(buf,targetW,ENG);
+      setArchive(a.addrs,f.name);
+      el.textContent='lossless: “'+f.name+'” ('+buf.length+' B) → '+a.count+' page(s) of '+targetW+'×'+targetW+' · CRC '+('0x'+a.crc.toString(16))+' · address below';
+      showPage(a.addrs[0]);
+    }catch(err){el.textContent='archive failed: '+(err.message||err)}
+    e.target.value='';return;
+  }
+  /* 1) our own exhibit PNG → exact pixels + embedded address */
+  let d={error:'not a library png'};try{d=await decodePng(buf)}catch(_){}
+  if(!d.error&&d.indices){
+    const r=findPage(d.indices,d.w,ENG);
+    if(!r.error){
+      const same=d.textAddress&&normalizeAddr(d.textAddress)===normalizeAddr(r.addr);
+      let info='exact exhibit '+d.w+'×'+d.w+' · palette '+(d.exact?'matches library (exact)':'differs');
+      info+=' · tEXt in file: '+(d.textAddress?(same?'✓ matches recomputed address':'✗ differs from recomputed'):'(none)');
+      el.textContent=info;showPage(r.addr);e.target.value='';return;
+    }
+  }
+  /* 2) any other image (JPEG/GIF/WebP/other PNG/large) → rescale + nearest colour, optional dither */
+  try{
+    const dith=$('#ditherChk').checked;
+    const q=await imageToIndices(f,targetW,dith);
+    const r=findPage(q.indices,targetW,ENG);
+    if(r.error){el.textContent='mapped but: '+r.error;e.target.value='';return}
+    el.textContent=(dith?'dithered ':'nearest ')+targetW+'×'+targetW+' preview of “'+f.name+'” · maxΔRGB '+q.maxDist.toFixed(0)+' · ≈'+q.psnr.toFixed(1)+' dB · address below';
+    showPage(r.addr);
+  }catch(err){el.textContent='could not decode image: '+(err.message||err)}
+  e.target.value='';
+});
+
+/* lossless archive result box + rebuild/download */
+let ARCH=null;
+function setArchive(addrs,name){ARCH={addrs,name};$('#archBox').value=addrs.map(x=>normalizeAddr(x)).join('\n');$('#archNote').textContent=name+' · '+addrs.length+' page(s)';}
+$('#btnArchDl').onclick=()=>{if(!ARCH||ARCH.addrs.length!==1){$('#loadInfo').textContent='this archive has multiple pages — use Restore below';return}
+  const r=archiveRestore(ARCH.addrs,ENG);if(r.error){$('#loadInfo').textContent=r.error;return}dl(ARCH.name,r.data,'application/octet-stream')};
+$('#btnArchRestore').onclick=async()=>{
+  const addrs=$('#archIn').value.split(/\s+/).filter(Boolean);
+  if(!addrs.length){$('#loadInfo').textContent='paste archive addresses first';return}
+  const r=archiveRestore(addrs,ENG);
+  if(r.error){$('#loadInfo').textContent='RESTORE FAILED: '+r.error;return}
+  $('#loadInfo').textContent='restored '+r.data.length+' bytes from '+addrs.length+' page(s), CRC verified ✓';
+  dl('restored-'+(r.w)+'b.bin',r.data,'application/octet-stream');
+};
+
+/* ------------------------------------------------------------------ */
+/* Self-test suite                                                    */
+/* ------------------------------------------------------------------ */
+function eqBytes(a,b){if(a.length!==b.length)return false;for(let i=0;i<a.length;i++)if(a[i]!==b[i])return false;return true}
+function rand(n){const b=new Uint8Array(n);crypto.getRandomValues(b);return b}
+async function runTests(){
+  const log=[];let pass=0,fail=0;
+  const ok=(cond,label)=>{cond?pass++:fail++;log.push((cond?'✓ ':'✗ ')+label)};
+  /* engine presence + status */
+  ok(ENG.name==='wasm','WASM core built ('+ENG.name+' engine active'+(ENG.name==='wasm'?', JS fallback also present)':')'));
+  /* known vectors: CRC32 of "123456789" is 0xCBF43926 ; RFC4648 base32("hi")="NBUQ====" */
+  ok(crcRef(new Uint8Array([...'123456789'].map(c=>c.charCodeAt(0))))===0xCBF43926,'CRC32 test vector 0xCBF43926 (JS)');
+  ok(ENG.crc(new Uint8Array([...'123456789'].map(c=>c.charCodeAt(0))))===0xCBF43926,'CRC32 test vector 0xCBF43926 ('+ENG.name+')');
+  ok(b32eRef([0x68,0x69])==='NBUQ','RFC4648 base32("hi") → "NBUQ" (no pad) (JS)');
+  ok(ENG.b32e(new Uint8Array([0x68,0x69]))==='NBUQ','RFC4648 base32("hi") → "NBUQ" ('+ENG.name+')');
+  ok(b32dRef('NBUQ')&&eqBytes(b32dRef('NBUQ'),new Uint8Array([0x68,0x69])),'base32 decode inverse vector (JS)');
+  ok(eqBytes(ENG.b32d('NBUQ'),new Uint8Array([0x68,0x69])),'base32 decode inverse vector ('+ENG.name+')');
+  ok(ENG.b32d('NB!X')===null,'base32 decode rejects invalid chars ('+ENG.name+')');
+  /* parity: the engine's expand/compact (the WASM exports) against the JS reference.
+     base32/CRC run in JS for both engines, so they are covered by the fixed vectors above. */
+  let parity=true;
+  for(let t=0;t<60;t++){
+    const n=1+Math.floor(Math.random()*511);
+    const b=rand(n);
+    if(!eqBytes(ENG.expand(b),expandRef(b)))parity=false;
+    const idx=rand(2*n);for(let k=0;k<idx.length;k++)idx[k]&=15;
+    if(!eqBytes(ENG.compact(idx),compactRef(idx)))parity=false;
+  }
+  ok(parity, (ENG.name==='wasm'?'WASM':'JS')+' expand/compact ≡ JS reference on 60 random payloads');
+  /* bijection constants for every size */
+  for(const w of[8,16,32]){
+    const c=consts(w);
+    ok(gcd(c.C,c.N)===1n,'w='+w+': gcd(C,N)=1');
+    ok((c.C*c.I)%c.N===1n,'w='+w+': C·I ≡ 1 mod N (search inverts read exactly)');
+    ok(c.C<c.N,'w='+w+': C < N');
+  }
+  /* full round trips, both directions, both engines */
+  for(const w of[8,16,32])for(const E of[jsEngine,ENG]){
+    let t1=true,t2=true,t3=true;
+    for(let k=0;k<8;k++){
+      const A=randomIndex(w);
+      const addr=addrFromIndex(A,w,E);
+      const r=readPage(addr,E);
+      if(r.error||r.w!==w) t1=false;
+      else{
+        let s=normalizeAddr(addr);
+        if(s.length!==(w===8?59:w===16?212:827))t1=false;
+        const f=findPage(r.indices,w,E);
+        if(f.error||normalizeAddr(f.addr)!==s)t2=false;
+      }
+      const idx=rand(w*w);for(let q=0;q<idx.length;q++)idx[q]&=15;
+      const f=findPage(idx,w,E);
+      if(f.error){if(bytesToBig(E.compact(idx))!==consts(w).N)t3=false}
+      else{const r2=readPage(f.addr,E);
+        if(r2.error){log.push('! diag readPage(f.addr): '+r2.error);t3=false}
+        else if(!eqBytes(r2.indices,idx))t3=false}
+    }
+    ok(t1,'w='+w+'/'+E.name+': index→address→image valid, address length exact');
+    ok(t2,'w='+w+'/'+E.name+': image→address→image identical bytes (round trip A→V→A→V→A)');
+    ok(t3,'w='+w+'/'+E.name+': random image→address→image identical (FIND then READ)');
+  }
+  /* boundary pages */
+  {
+    const black=new Uint8Array(64),white=new Uint8Array(64).fill(15);
+    const fb=findPage(black,8,ENG);
+    ok(!fb.error&&fb.A===consts(8).N,'all-black page exists at index N');
+    const fw=findPage(white,8,ENG);
+    ok(fw.error&&/no index/.test(fw.error),'all-white page has no index (boundary case)');
+    const rn=readPage(addrFromIndex(consts(8).N,8,ENG),ENG);
+    ok(!rn.error&&eqBytes(rn.indices,black),'index-N page renders and is exactly the all-black image');
+  }
+  /* checksum catches typos */
+  {
+    const A=randomIndex(8),addr=normalizeAddr(addrFromIndex(A,8,ENG));
+    const flip=(addr[0]==='A'?'B':'A');
+    const bad=flip+addr.slice(1);
+    const r=readPage(bad,ENG);
+    ok(r.error&&/checksum/.test(r.error),'single-character address typo → checksum error');
+    const r2=readPage('A'.repeat(50)+'AAAAAAAAAAA',ENG);
+    ok(r2.error!==undefined,'garbage address rejected with a reason');
+  }
+  /* embedded messages */
+  for(const[w,text]of[[8,'café ☕ 8×8'],[16,'The quick brown fox jumps over the lazy dog.'],[32,'round-trip test payload 32x32: 日本語 π²']]){
+    const r=embedText(text,w,ENG);
+    const p=readPage(r.addr,ENG);
+    ok(p.msg&&p.msg.text===text,'w='+w+': embedded "'+text.slice(0,24)+'" recovered from address');
+  }
+  /* exhibit PNG: download then find, same code */
+  {
+    const A=randomIndex(16),addr=normalizeAddr(addrFromIndex(A,16,ENG));
+    const r=readPage(addr,ENG);
+    const png=encodeExhibitPng(r.w,r.vbytes,addr);
+    const d=await decodePng(png);
+    ok(!d.error,'exhibit PNG parses');
+    ok(d.exact,'exhibit PNG palette = canonical library palette');
+    ok(eqBytes(d.indices,r.indices),'exhibit PNG pixels identical to page');
+    const back=findPage(d.indices,d.w,ENG);
+    ok(normalizeAddr(back.addr)===addr,'exhibit PNG: address recomputed from pixels equals the address in its tEXt');
+    const e=embedText('PNG exhibit round trip',32,ENG);
+    const pe=readPage(e.addr,ENG);
+    const png2=encodeExhibitPng(pe.w,pe.vbytes,normalizeAddr(e.addr));
+    const d2=await decodePng(png2);
+    ok(eqBytes(d2.indices,pe.indices),'exhibit with message round-trips pixels');
+  }
+  /* LOSSLESS ARCHIVE: exact bytes → pages → back, bit-for-bit, incl. multi-page chain */
+  for(const[w,size]of[[16,300],[32,480],[8,60],[32,1500]]){
+    const src=rand(size);                       /* arbitrary bytes, like any file */
+    const a=archiveToAddresses(src,w,ENG);
+    ok(a.count===Math.ceil(size/(consts(w).nbytes-ARCH_HDR)),'archive w='+w+' '+size+'B → '+a.count+' page(s)');
+    const back=archiveRestore(a.addrs,ENG);
+    ok(!back.error&&back.data.length===size&&eqBytes(back.data,src),'archive w='+w+' '+size+'B restored bit-for-bit (CRC ✓)');
+  }
+  {
+    const a=archiveToAddresses(rand(900),32,ENG);
+    const dropped=[a.addrs[0]];                  /* incomplete set must be refused */
+    const r=archiveRestore(dropped,ENG);
+    ok(r.error&&/incomplete|missing|have/.test(r.error),'incomplete archive refused: '+(r.error||'').slice(0,30));
+    const tam=a.addrs.slice(); tam[0]=normalizeAddr(tam[0]).slice(0,-2)+'AA';  /* corrupt a fragment */
+    const r2=archiveRestore(tam,ENG);
+    ok(r2.error!==undefined,'corrupted archive page refused (checksum/CRC)');
+  }
+  /* lossless and colour-preview are the SAME page bytes, two readings */
+  {
+    const src=rand(300);const a=archiveToAddresses(src,32,ENG);
+    const p=readPage(a.addrs[0],ENG);
+    ok(!p.error&&p.indices.length===32*32,'archive page is also a valid colour page (pure bijection intact)');
+  }
+  /* standalone exhibit html is self-contained */
+  {
+    const html=buildExhibitHtml(normalizeAddr(addrFromIndex(randomIndex(8),8,ENG)));
+    ok(html.includes('<canvas')&&html.includes('function parseAddr')&&html.includes('function readPage')&&html.includes('function modinv')&&!/src=/.test(html),'standalone exhibit embeds the full decoder, no external src');
+  }
+  const line='SELF-TEST '+pass+' pass / '+fail+' fail';
+  $('#testSum').textContent=line;$('#testSum').className=fail?'err big':'ok big';
+  $('#testLog').textContent=log.join('\n');
+  console.log('[pixel-babel] '+line+'\n'+log.join('\n'));
+  window.__TEST__={pass,fail,lines:log};
+  return window.__TEST__;
+}
+$('#btnTest').onclick=()=>runTests();
+if(location.search.includes('test=1'))setTimeout(()=>runTests(),50);
+
+/* boot: engine tag + a first paintable page */
+$('#engineTag').textContent='core: '+(ENG.name==='wasm'?'WASM (self-verified)':'JS reference (WASM auto-fallback)');
+$('#btnRandom').click();
+</script>
+</body>
+</html>
