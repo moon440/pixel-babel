@@ -1,8 +1,9 @@
 # Pixel Babel
 
 A [Library of Babel](https://en.wikipedia.org/wiki/The_Library_of_Babel) for pixel
-images. Every 8×8, 16×16 and 32×32 image using a fixed 16-colour palette exists at
-exactly one address, and every address decodes to exactly one image. There is no
+images. Every 8×8, 16×16 and 32×32 image using a fixed 16-colour palette has exactly
+one address, and every address decodes to exactly one image. One image, the
+all-white page, has no address; see *How it works*. There is no
 database and no server: an index of the image space is turned into page contents by
 modular multiplication, and back again by multiplying with its inverse.
 
@@ -49,7 +50,7 @@ the two directions are exact inverses. This is the method used by
 Indices run 1..N. The value `V = N` (every pixel the last palette entry, a pure
 white page) has no index, since `(I · N) mod N = 0`. Exactly one image out of
 `16^L` is unreachable; the reference implementations lose one book for the same
-reason. Self-tests assert this and all other cases.
+reason. The self-test checks this case directly.
 
 Capacity per page is `L × 4` bits: 256, 1024 and 4096 bits for 8×8, 16×16 and
 32×32. A page can be read as colour indices or as raw data, so the same mechanism
@@ -62,7 +63,8 @@ Open `index.html?test=1` or press *Run self-tests*. The suite verifies: WASM ver
 JS equality for the pixel codec, CRC32 and base32 test vectors, exhaustive bijection
 properties for every size, image/address round-trips, boundary pages, checksum
 rejection of typos, embedded messages, exhibit PNG round-trips and lossless archive
-round-trips including multi-page and corrupted sets. All checks are deterministic.
+round-trips including multi-page and corrupted sets. Payloads are random
+(property-based testing); the fixed vectors and the verdict logic are deterministic.
 
 ## Repository layout
 
