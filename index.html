@@ -625,7 +625,7 @@ function showPage(addr){
   if(r.error){err.textContent=r.error;return}
   currentAddr=addr;pageSize=r.w;paintBuf=r.indices.slice();
   drawIndices(r.w,r.indices);
-  $('#addrBox').value=groupAddr(addr);
+  $('#addrBox').value=groupAddr(normalizeAddr(addr));
   $('#pageInfo').textContent=r.w+'×'+r.w+' page · index = '+r.A.toString(36).slice(0,12)+'… (base36, '+r.A.toString(16).length+' hex digits) · N = 16^'+r.w*r.w+'−1';
   $('#hexDump').textContent=hexDump(r.vbytes);
   $('#msgOut').textContent=r.msg?('text in this page: "'+r.msg.text+'"'):'no embedded message';
@@ -683,7 +683,7 @@ $('#btnEmbed').onclick=()=>{
   try{
     const r=embedText(t,curSize(),ENG);
     showPage(r.addr);
-    $('#pageInfo').textContent+=' · embedded message: '+t;
+    $('#pageInfo').textContent=$('#pageInfo').textContent+' · embedded message: '+t;
   }catch(e){$('#pageErr').textContent=e.message}
 };
 
