@@ -76,6 +76,28 @@ LICENSE      GNU Affero General Public License v3 or later
 README.md    this file
 ```
 
+## Babel Text (babeltext.html)
+
+Packs text into a library page and reads it back. Three containers,
+smallest wins per page: D1 (LZ77 + fixed Huffman, primed with an embedded
+English dictionary the decoder also carries), TEXT2 (adaptive order-1 range
+coder trained from the same prior), and a raw zlib stream for input.py and
+output.py interop.
+
+Measured on fresh English prose (not present in the dictionary), 32x32 page:
+
+| method                | words per page |
+|-----------------------|----------------|
+| plain fixed-code      | ~120 |
+| this page (D1/TEXT2)  | 153 |
+| zlib level 9          | 164-170 |
+| zlib + dictionary     | 201 |
+
+The last line is the remaining headroom: it needs dynamic Huffman tables in
+the in-page encoder, which is the next step for babeltext.html. Word counts
+scale proportionally for 16x16 (128 B) and 8x8 (32 B) pages: roughly 38 and
+9 words of prose.
+
 ## OTP (otp.html)
 
 `otp.html` encrypts any text or file, losslessly:
