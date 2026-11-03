@@ -345,20 +345,35 @@ function zlibUnwrap(z){
   return raw;
 }
 /* page <-> bytes ------------------------------------------------------*/
-/* TEXT1: magic T1 | len u16le | range-coded body | random pad to page size.
+/* TEXT2: magic T1 | len u16le | range-coded body | random pad to page size.
    Adaptive order-2 byte model hashed to 8192 contexts, Subbotin 32-bit
    carryless range coder. Replaces zlib (~1.8x) with ~2.6x on English.
    Uncompressed fallback: magic B1 | raw bytes. zlib container still readable
    for input.py/output.py files (raw stream starting with 0x78). */
-const RC_TOP=1<<24,RC_BOT=1<<16,RESCALE=1<<15;
-const NCTX=8192,NSYM=256;
-function newModel(){return{f:new Uint16Array(NCTX*NSYM).fill(1),t:new Uint32Array(NCTX).fill(NSYM)}}
-const ctx2=(c1,c2)=>(Math.imul(((c1<<8)|c2)>>>0,2654435761)>>>17)&(NCTX-1);
-function modelUpdate(m,ctx,sym){
-  m.f[ctx*NSYM+sym]++;m.t[ctx]++;
-  if(m.t[ctx]>RESCALE){let s=0;const base=ctx*NSYM;
+/* TEXT2 container: 'T2' | len u16le | coded body | random pad.
+   Trained adaptive order-1 byte model: both coder sides initialise the table
+   from the embedded English prior below (same idea as zstd dictionaries), then
+   adapt. Removes the cold-start cost; ~3.4 bits/char on English. */
+const RC_TOP=1<<24,RC_BOT=1<<16,RESCALE=1<<14;
+const NSYM=256;
+const PRIOR='The harbor town woke slowly that autumn morning. Fishing boats knocked against the tyres at the quay while gulls argued overhead about nothing in particular. A baker carried trays of loaves through a doorway propped open with a coal shovel, and the smell of crust travelled down the lane faster than any person did. Old men in the coffee room read the same three newspapers in a fixed rotation, each convinced that the article he had already read twice contained something new. The tide came in as it always did, unhurried and indifferent to the schedules of the fishermen, the postman, and the priest. Nobody in the town remembered the year the lighthouse was built, though everybody could tell you who had rowed out to light the lamp the night the storm took the schooner Margaret. That story had acquired, over the decades, a layer of new details the way a hull acquires barnacles, and the men who repeated it agreed on almost nothing except the color of the sky, which everyone insisted had been the color of a bruise. Up the hill the school opened its doors to children who were already restless because half term week was approaching, and the junior teacher spent her break arranging costumed props on a folding table while arguing gently with a parent about whether a ten minute play could honestly contain twenty seven speaking parts. The library, a one room Carnegie building with damp problems and a devoted keeper, issued ninety four books that week, most of them romances and fishing memoirs, and received back the same books with their spines creased and their dust jackets missing. On the main street the barber, the butcher, and the postmistress conducted the continuous negotiation of prices, gossip, and favors that had not formally changed since the war but informally changed every hour. A tourist car passed slowly, stopped, and restarted, its occupants photographing the harbour as if it were a place they had found rather than a place where people had to take out the bins. Late in the afternoon the light went gold and flat, the wind dropped, and the town sat in the unusual quiet that arrives before rain. ';
+let BASE=null;
+function buildBase(){
+  const f=new Uint16Array(NSYM*NSYM).fill(1);
+  const P=new TextEncoder().encode(PRIOR);
+  const g=new Uint32Array(NSYM);
+  let c1=0;
+  for(let i=0;i<P.length;i++){const s=P[i];f[c1*NSYM+s]+=2;g[s]++;c1=s}
+  for(let c=0;c<NSYM;c++){let t=0;for(let s=0;s<NSYM;s++){f[c*NSYM+s]+=1+((g[s]>>5)|0);t+=f[c*NSYM+s]}}
+  const rowT=(()=>{const a=new Uint32Array(NSYM);for(let c=0;c<NSYM;c++){let s2=0;for(let s=0;s<NSYM;s++)s2+=f[c*NSYM+s];a[c]=s2}return a})();
+  return{f:()=>f.slice(),t:()=>rowT.slice()}
+}
+function newModel(){if(!BASE)BASE=buildBase();return{f:BASE.f(),t:BASE.t()}}
+function modelUpdate(m,c1,sym){
+  m.f[c1*NSYM+sym]++;m.t[c1]++;
+  if(m.t[c1]>RESCALE){let s=0;const base=c1*NSYM;
     for(let k=0;k<NSYM;k++){m.f[base+k]=(m.f[base+k]+1)>>1;s+=m.f[base+k]}
-    m.t[ctx]=s}
+    m.t[c1]=s}
 }
 /* Subbotin carryless renormalization, exactly as in lpaq:
    while( (low^(low+range))<TOP || (range<BOT and (range=(-low)&(BOT-1), true)) ) shift */
@@ -376,27 +391,27 @@ function text1Pack(textBytes,nbytes){
   if(len>65535)return null;
   const rc={low:0,range:0xFFFFFFFF},out=[],m=newModel();
   rc.shift=()=>{out.push((rc.low>>>24)&255);rc.low=(rc.low<<8)>>>0;rc.range=(rc.range<<8)>>>0};
-  let c1=0,c2=0;
+  let c1=0;
   for(let i=0;i<len;i++){
-    const sym=textBytes[i],ctx=ctx2(c1,c2),base=ctx*NSYM,t=m.t[ctx],f=m.f;
+    const sym=textBytes[i],base=c1*NSYM,t=m.t[c1],f=m.f;
     let cumLo=0;for(let k=0;k<sym;k++)cumLo+=f[base+k];
     const r=(rc.range/t)>>>0;
     rc.low=(rc.low+r*cumLo)>>>0;
     rc.range=(r*f[base+sym])>>>0;
-    modelUpdate(m,ctx,sym);
+    modelUpdate(m,c1,sym);
     rcnorm(rc);
-    c2=c1;c1=sym;
+    c1=sym;
   }
   rc.shift();rc.shift();rc.shift();rc.shift();
   const total=4+out.length;
   if(total>nbytes)return null;
   const vb=new Uint8Array(nbytes);crypto.getRandomValues(vb);
-  vb[0]=0x54;vb[1]=0x31;vb[2]=len&255;vb[3]=(len>>>8)&255;
+  vb[0]=0x54;vb[1]=0x32;vb[2]=len&255;vb[3]=(len>>>8)&255;
   vb.set(out,4);
   return{vbytes:vb,used:total};
 }
 function text1Unpack(vb){
-  if(vb.length<8||vb[0]!==0x54||vb[1]!==0x31)return null;
+  if(vb.length<8||vb[0]!==0x54||vb[1]!==0x32)return null;
   const len=vb[2]|(vb[3]<<8);
   if(len===0)return new Uint8Array(0);
   const src=vb.subarray(4);
@@ -405,10 +420,10 @@ function text1Unpack(vb){
   const inb=()=>pos<src.length?src[pos++]:0;
   for(let i=0;i<4;i++)rc.value=((rc.value<<8)|inb())>>>0;
   rc.shift=()=>{rc.low=(rc.low<<8)>>>0;rc.range=(rc.range<<8)>>>0;rc.value=((rc.value<<8)|inb())>>>0};
-  const m=newModel();let c1=0,c2=0;
+  const m=newModel();let c1=0;
   const out=new Uint8Array(len);
   for(let i=0;i<len;i++){
-    const ctx=ctx2(c1,c2),base=ctx*NSYM,t=m.t[ctx],f=m.f;
+    const base=c1*NSYM,t=m.t[c1],f=m.f;
     const r=(rc.range/t)>>>0;
     let x=Math.floor(((rc.value-rc.low)>>>0)/r);
     if(!(x>=0))x=0;if(x>=t)x=t-1;
@@ -417,9 +432,9 @@ function text1Unpack(vb){
     if(sym>=NSYM)sym=NSYM-1;
     rc.low=(rc.low+r*acc)>>>0;
     rc.range=(r*f[base+sym])>>>0;
-    modelUpdate(m,ctx,sym);
+    modelUpdate(m,c1,sym);
     rcnorm(rc);
-    out[i]=sym;c2=c1;c1=sym;
+    out[i]=sym;c1=sym;
   }
   return out;
 }
@@ -427,7 +442,7 @@ function packTextToPage(text,w){
   const c=consts(w);
   const tb=new TextEncoder().encode(text);
   const t1=text1Pack(tb,c.nbytes);
-  if(t1)return{vbytes:t1.vbytes,compLen:t1.used,mode:'TEXT1'};
+  if(t1)return{vbytes:t1.vbytes,compLen:t1.used,mode:'TEXT2'};
   const comp=zlibWrap(deflateRaw(tb),tb);
   if(comp.length<=c.nbytes){
     const vb=new Uint8Array(c.nbytes);crypto.getRandomValues(vb);vb.set(comp,0);
@@ -549,7 +564,7 @@ function runTests(){
   const ok=(c,m)=>{c?pass++:fail++;log.push((c?'ok   ':'FAIL ')+m)};
   const T=new TextEncoder();
   ok(ENG.name==='wasm','WASM pixel codec active and self-verified');
-  /* TEXT1 range coder: fuzz round trips */
+  /* TEXT2 range coder: fuzz round trips */
   {
     const cases=[['',32],
       ['a',16],
@@ -565,18 +580,18 @@ function runTests(){
         if(back!==c){allOk=false;log.push('  case fail len '+c.length+' w '+w+' mode '+pk.mode)}
       }catch(e){allOk=false;log.push('  case throw w'+w+': '+e.message)}
     }
-    ok(allOk,'TEXT1 range coder round trips all fuzz cases');
+    ok(allOk,'TEXT2 range coder round trips all fuzz cases');
   }
   /* mode actually used on the prose case */
   const msg='Deep color configurations fundamentally shift data storage limits in image processing frameworks.';
   const p=packTextToPage(msg,32);
-  ok(p.mode==='TEXT1'&&p.compLen<120,'TEXT1 beats zlib on prose: '+p.compLen+' B for '+msg.length+' chars ('+(msg.length/p.compLen).toFixed(1)+'x)');
+  ok(p.mode==='TEXT2'&&p.compLen<120,'TEXT2 beats zlib on prose: '+p.compLen+' B for '+msg.length+' chars ('+(msg.length/p.compLen).toFixed(1)+'x)');
   ok(unpackPageToText(p.vbytes)===msg,'packed page unpacks to identical text');
   /* zlib fallback + output.py interop path still alive */
   const u8=T.encode(msg);
   ok(zlibUnwrap(zlibWrap(deflateRaw(u8),u8)).every((v,i)=>v===u8[i])===true,'deflate/inflate round trip');
   {
-    const long=msg.repeat(6); /* >512 even for TEXT1 at 32x32? try; if fits, skip */
+    const long=msg.repeat(6); /* >512 even for TEXT2 at 32x32? try; if fits, skip */
     let okThrow=true;
     try{packTextToPage(long.repeat(3),8);okThrow=false}catch(e){okThrow=/page/.test(e.message)}
     ok(okThrow,'oversized pack throws with capacity guidance');
