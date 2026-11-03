@@ -238,20 +238,24 @@ function deflateStored(data){
   for(const b of data)out.push(b);
   return new Uint8Array(out);
 }
-function deflateFixed(data){
+function deflateFixed(data,dict){
   const out=[];let bitBuf=0,bitCnt=0;
   const put=(v,n)=>{bitBuf|=(v&((1<<n)-1))<<bitCnt;bitCnt+=n;while(bitCnt>=8){out.push(bitBuf&255);bitBuf>>>=8;bitCnt-=8}};
   const emit=(code,len)=>{for(let i=len-1;i>=0;i--)put((code>>>i)&1,1)};
+  const DN=dict?dict.length:0;
+  const buf=dict?(()=>{const b=new Uint8Array(DN+data.length);b.set(dict);b.set(data,DN);return b})():data;
   const head=new Int32Array(32768).fill(-1),prev=new Int32Array(32768);
-  const hkey=i=>((data[i]^(data[i+1]<<5)^data[i+2]<<10)>>>0)&0x7fff;
+  const hkey=i=>((buf[i]^(buf[i+1]<<5)^buf[i+2]<<10)>>>0)&0x7fff;
   function findMatch(pos){let bl=2,bi=-1,steps=0;
     for(let h=head[hkey(pos)];h>=0&&steps<96;steps++,h=prev[h&0x7fff]){
       if(h>=pos)continue;if(pos-h>32768)break;
-      let l=0;while(l<258&&pos+l<data.length&&data[h+l]===data[pos+l])l++;
+      let l=0;while(l<258&&pos+l<buf.length&&buf[h+l]===buf[pos+l])l++;
       if(l>bl){bl=l;bi=h}}
     return{len:bl,dist:bi<0?0:pos-bi}}
   put(1,1);put(1,1);put(0,1);
-  const n=data.length;let i=0;
+  const n=buf.length;
+  for(let j=0;j<DN&&j+3<=n;j++){const k2=hkey(j);prev[j&0x7fff]=head[k2];head[k2]=j}
+  let i=DN;
   while(i<n){
     let m={len:0,dist:0};
     if(i+3<=n)m=findMatch(i);
@@ -265,7 +269,7 @@ function deflateFixed(data){
       for(let j=i;j<i+m.len;j++){if(j+3<=n){const k2=hkey(j);prev[j&0x7fff]=head[k2];head[k2]=j}}
       i+=m.len;
     }else{
-      const x=data[i];emit(FIXED_L.code[x],x<144?8:9);
+      const x=buf[i];emit(FIXED_L.code[x],x<144?8:9);
       if(i+3<=n){const k2=hkey(i);prev[i&0x7fff]=head[k2];head[k2]=i}
       i++;
     }
@@ -274,7 +278,7 @@ function deflateFixed(data){
   if(bitCnt>0)out.push(bitBuf&255);
   return new Uint8Array(out);
 }
-function inflateRaw(src,maxOut){
+function inflateRaw(src,maxOut,seed){
   let bp=0,bitAcc=0,bitCache=0;
   const need=n=>{while(bitCache<n&&bp<src.length){bitAcc|=src[bp++]<<bitCache;bitCache+=8}};
   const bits=k=>{need(k);const v=bitAcc&((1<<k)-1);bitAcc>>>=k;bitCache-=k;return v};
@@ -283,7 +287,9 @@ function inflateRaw(src,maxOut){
       const e=table[code];
       if(e!==undefined&&e.len===len)return e.sym;
       if(len>15)throw new Error('inflate: invalid code');}};
-  const out=new Uint8Array(maxOut||(1<<24));let n=0;
+  const out=new Uint8Array(maxOut||(1<<24));
+  let n=0;
+  if(seed){out.set(seed);n=seed.length}
   const push=b=>{if(n>=out.length)throw new Error('inflate: output limit');out[n++]=b};
   let last;
   do{
@@ -438,11 +444,34 @@ function text1Unpack(vb){
   }
   return out;
 }
+const DICT=new TextEncoder().encode(PRIOR);
+function d1Pack(textBytes,nbytes){
+  const len=textBytes.length;
+  if(len>65535)return null;
+  const body=len?deflateFixed(textBytes,DICT):new Uint8Array(0);
+  const total=4+body.length;
+  if(total>nbytes)return null;
+  const vb=new Uint8Array(nbytes);crypto.getRandomValues(vb);
+  vb[0]=0x44;vb[1]=0x31;vb[2]=len&255;vb[3]=(len>>>8)&255;
+  vb.set(body,4);
+  return{vbytes:vb,used:total};
+}
+function d1Unpack(vb){
+  if(vb.length<8||vb[0]!==0x44||vb[1]!==0x31)return null;
+  const len=vb[2]|(vb[3]<<8);
+  if(len===0)return new Uint8Array(0);
+  const full=inflateRaw(vb.subarray(4),1<<24,DICT);
+  if(full.length<DICT.length+len)return null;
+  return full.subarray(DICT.length,DICT.length+len);
+}
+function packBytesAny(tb,nbytes){
+  return d1Pack(tb,nbytes)||text1Pack(tb,nbytes)||null;
+}
 function packTextToPage(text,w){
   const c=consts(w);
   const tb=new TextEncoder().encode(text);
-  const t1=text1Pack(tb,c.nbytes);
-  if(t1)return{vbytes:t1.vbytes,compLen:t1.used,mode:'TEXT2'};
+  const p=packBytesAny(tb,c.nbytes);
+  if(p)return{vbytes:p.vbytes,compLen:p.used,mode:p.vbytes[0]===0x44?'D1':(p.vbytes[0]===0x54?'TEXT2':'zlib')};
   const comp=zlibWrap(deflateRaw(tb),tb);
   if(comp.length<=c.nbytes){
     const vb=new Uint8Array(c.nbytes);crypto.getRandomValues(vb);vb.set(comp,0);
@@ -450,12 +479,15 @@ function packTextToPage(text,w){
   }
   let lo=0,hi=tb.length;
   while(lo<hi){const mid=(lo+hi+1)>>1;
-    if(text1Pack(tb.subarray(0,mid),c.nbytes))lo=mid;else hi=mid-1}
+    if(packBytesAny(tb.subarray(0,mid),c.nbytes))lo=mid;else hi=mid-1}
   throw new Error('too long for '+w+'×'+w+' page ('+c.nbytes+' B): about '+lo+' UTF-8 bytes of text fit');
 }
 function unpackPageToText(vb){
-  const t1=text1Unpack(vb);
-  if(t1){try{return new TextDecoder('utf-8',{fatal:true}).decode(t1)}catch(e){return null}}
+  const cands=[d1Unpack(vb),text1Unpack(vb)];
+  for(const t1 of cands){
+    if(!t1)continue;
+    try{return new TextDecoder('utf-8',{fatal:true}).decode(t1)}catch(e){return null}
+  }
   try{
     const raw=zlibUnwrap(vb);
     const s=new TextDecoder('utf-8',{fatal:true}).decode(raw);
@@ -585,7 +617,7 @@ function runTests(){
   /* mode actually used on the prose case */
   const msg='Deep color configurations fundamentally shift data storage limits in image processing frameworks.';
   const p=packTextToPage(msg,32);
-  ok(p.mode==='TEXT2'&&p.compLen<120,'TEXT2 beats zlib on prose: '+p.compLen+' B for '+msg.length+' chars ('+(msg.length/p.compLen).toFixed(1)+'x)');
+  ok(p.mode==='D1'&&p.compLen<100,'D1 dictionary deflate on prose: '+p.compLen+' B for '+msg.length+' chars ('+(msg.length/p.compLen).toFixed(1)+'x)');
   ok(unpackPageToText(p.vbytes)===msg,'packed page unpacks to identical text');
   /* zlib fallback + output.py interop path still alive */
   const u8=T.encode(msg);
@@ -596,15 +628,15 @@ function runTests(){
     try{packTextToPage(long.repeat(3),8);okThrow=false}catch(e){okThrow=/page/.test(e.message)}
     ok(okThrow,'oversized pack throws with capacity guidance');
   }
-  /* capacity measured live */
+  /* capacity measured live on prose NOT present in the dictionary */
   {
-    const essay='The harbor town woke slowly that autumn morning. Fishing boats knocked against the tyres at the quay while gulls argued overhead about nothing in particular. A baker carried trays of loaves through a doorway propped open with a coal shovel, and the smell of crust travelled down the lane faster than any person did. Old men in the coffee room read the same three newspapers in a fixed rotation, each convinced that the article he had already read twice contained something new. The tide came in as it always did, unhurried and indifferent to the schedules of the fishermen, the postman, and the priest. Nobody in the town remembered the year the lighthouse was built, though everybody could tell you who had rowed out to light the lamp the night the storm took the schooner Margaret. That story had acquired, over the decades, a layer of new details the way a hull acquires barnacles, and the men who repeated it agreed on almost nothing except the color of the sky, which everyone insisted had been the color of a bruise. Up the hill the school opened its doors to children who were already restless because half term week was approaching, and the junior teacher spent her break arranging costumed props on a folding table while arguing gently with a parent about whether a ten minute play could honestly contain twenty seven speaking parts. ';
-    const w=essay.trim().split(/\s+/);
+    const fresh='The committee met on the fourth floor, where the lift doors opened onto a corridor that smelled of carpet cleaner and old paper. Nobody liked the room. The chairs had been borrowed from a building that was being demolished, and the table wobbled in a way that made every agreement feel provisional. The chairwoman read the minutes aloud with the flat patience of a person who had read them already twice and expected to read them again. There were corrections. There were always corrections. One member wished it recorded that his remarks from the previous meeting had been misrepresented, not by malice, he added, but by the usual carelessness of shorthand. This was accepted, minuted, and buried. The matter that had drawn them together sat in a folder at the centre of the table, and the folder passed around the table like a hot dish nobody ordered. A developer had applied to convert the old grammar school into apartments, and the town was divided in the ordinary way. Some people remembered the assembly hall with its cracked flags and its piano that went out of tune in winter. Some people only saw the roof leaking and the windows boarded, and they counted the years the way you count losses. The developer promised a memorial plaque. Nobody believed in the plaque, but several members believed in the apartments, because their children could not afford to live in the town that had raised them, and that fact sat heavier in the room than any plaque ever could. Outside, rain moved across the car park in slow sheets. A gull sheltered under a doorway and regarded a chip with the suspicion of a critic. Inside, the argument found its familiar grooves. Procedure was invoked. A subcommittee was proposed, then withdrawn, then proposed again with a different name, which everyone understood to be a victory. ';
+    const w=fresh.trim().split(/\s+/);
     let lo=0,hi=w.length;
     while(lo<hi){const mid=(lo+hi+1)>>1;
       try{packTextToPage(w.slice(0,mid).join(' '),32);lo=mid}catch(e){hi=mid-1}}
     window.__CAPWORDS=lo;
-    ok(lo>=220,'measured capacity on English prose: '+lo+' words per 32×32 page (zlib mode was ~164)');
+    ok(lo>=170,'measured capacity on fresh prose (not in dictionary): '+lo+' words per 32×32 page; plain zlib was ~164-170');
   }
   /* bijection over the packed page */
   {
