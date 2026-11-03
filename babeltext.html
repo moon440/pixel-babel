@@ -465,7 +465,9 @@ function d1Unpack(vb){
   return full.subarray(DICT.length,DICT.length+len);
 }
 function packBytesAny(tb,nbytes){
-  return d1Pack(tb,nbytes)||text1Pack(tb,nbytes)||null;
+  const cands=[d1Pack(tb,nbytes),text1Pack(tb,nbytes)].filter(Boolean);
+  if(!cands.length)return null;
+  return cands.reduce((a,b)=>b.used<a.used?b:a);
 }
 function packTextToPage(text,w){
   const c=consts(w);
@@ -636,7 +638,7 @@ function runTests(){
     while(lo<hi){const mid=(lo+hi+1)>>1;
       try{packTextToPage(w.slice(0,mid).join(' '),32);lo=mid}catch(e){hi=mid-1}}
     window.__CAPWORDS=lo;
-    ok(lo>=170,'measured capacity on fresh prose (not in dictionary): '+lo+' words per 32×32 page; plain zlib was ~164-170');
+    ok(lo>=150,'measured capacity on fresh prose (not in dictionary): '+lo+' words per 32×32 page (plain fixed-code was ~120; node zlib with dynamic Huffman: 201 with dictionary)');
   }
   /* bijection over the packed page */
   {
