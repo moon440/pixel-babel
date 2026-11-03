@@ -555,7 +555,7 @@ function runTests(){
       'The harbor town woke slowly that autumn morning. Fishing boats knocked against the tyres at the quay while gulls argued overhead about nothing in particular.',
       'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
       'mixed 42 !? bytes\twith\ntabs\nand unicode π ☕ 🎉 café',
-      T.decode(Uint8Array.from(Array.from({length:300},(_,i)=>(i*7919)%256)))];
+      new TextDecoder().decode(Uint8Array.from(Array.from({length:300},(_,i)=>(i*7919)%256)))];
     let allOk=true;
     for(const c of cases){
       const pk=packTextToPage(c,16); /* 128 B budget exercises small pages */
