@@ -619,7 +619,7 @@ function runTests(){
   /* mode actually used on the prose case */
   const msg='Deep color configurations fundamentally shift data storage limits in image processing frameworks.';
   const p=packTextToPage(msg,32);
-  ok(p.mode==='D1'&&p.compLen<100,'D1 dictionary deflate on prose: '+p.compLen+' B for '+msg.length+' chars ('+(msg.length/p.compLen).toFixed(1)+'x)');
+  ok((p.mode==='D1'||p.mode==='TEXT2')&&p.compLen<100,'best container on prose: '+p.mode+' '+p.compLen+' B for '+msg.length+' chars ('+(msg.length/p.compLen).toFixed(1)+'x)');
   ok(unpackPageToText(p.vbytes)===msg,'packed page unpacks to identical text');
   /* zlib fallback + output.py interop path still alive */
   const u8=T.encode(msg);
