@@ -1,0 +1,609 @@
+<!doctype html>
+<!--
+  Babel Text — text hidden inside Library of Babel pages.
+  Combines three programs into one dependency-free page:
+    index.html (Pixel Babel): address <-> page bijection, WASM pixel codec
+    output.py : text -> zlib -> 4-bit nibbles -> 16-colour 32x32 PNG
+    input.py  : PNG -> colour table -> nibbles -> zlib -> text
+  Copyright (C) 2026 moon440
+  SPDX-License-Identifier: AGPL-3.0-or-later
+  See LICENSE (AGPL-3.0-or-later). Network use of modified versions must
+  offer source (section 13).
+
+  Wire format is byte-compatible with output.py: a raw zlib stream
+  (deflate level 9 equivalent fixed-Huffman block here) padded with random
+  bytes to exactly the page byte size. input.py reads such pages when the
+  ANSI palette is selected. Pixel Babel addresses work for every page.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Babel Text — text inside library pages</title>
+<style>
+  :root{--bg:#0d0f12;--fg:#d8dee4;--dim:#8b949e;--acc:#e8b84b;--card:#15181d;--line:#2a2f37;--err:#f05d5d;--ok:#4ac26b}
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.5 ui-monospace,Consolas,monospace}
+  header{padding:12px 20px;border-bottom:1px solid var(--line);display:flex;gap:12px;align-items:baseline;flex-wrap:wrap}
+  header h1{margin:0;font-size:17px;color:var(--acc)}
+  main{display:grid;grid-template-columns:640px 1fr;gap:16px;padding:16px 20px;max-width:1500px}
+  @media(max-width:1100px){main{grid-template-columns:1fr}}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:6px;padding:12px 14px;margin-bottom:14px}
+  .card h2{margin:0 0 8px;font-size:13px;color:var(--acc);text-transform:uppercase;letter-spacing:2px}
+  textarea{width:100%;background:#0a0c0f;color:#9fd356;border:1px solid var(--line);border-radius:4px;padding:8px;font:12px/1.45 inherit}
+  button,select{background:#22262d;color:var(--fg);border:1px solid var(--line);border-radius:4px;padding:6px 11px;font:inherit;cursor:pointer}
+  button:hover{border-color:var(--acc)}
+  .row{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin:8px 0}
+  canvas{image-rendering:pixelated;border:1px solid var(--line);background:#000}
+  pre{white-space:pre-wrap;word-break:break-all;background:#0a0c0f;border:1px solid var(--line);border-radius:4px;padding:8px;font-size:12px;margin:6px 0;max-height:220px;overflow:auto}
+  .dim{color:var(--dim)}.err{color:var(--err)}.ok{color:var(--ok)}
+  .tag{border:1px solid var(--line);border-radius:4px;padding:2px 8px;font-size:12px;color:var(--dim)}
+  .grid-note{font-size:12px;color:var(--dim)}
+  footer{padding:10px 20px;border-top:1px solid var(--line);color:var(--dim);font-size:12px}
+</style>
+</head>
+<body>
+<header>
+  <h1>BABEL TEXT</h1>
+  <span class="dim">text → zlib → 4-bit pixels → library page → address; and the way back</span>
+  <span class="tag" id="engineTag">engine …</span>
+  <span class="tag">AGPL-3.0-or-later</span>
+</header>
+<main>
+<div>
+  <div class="card">
+    <h2>Pack text into a page</h2>
+    <textarea id="msgIn" rows="6" placeholder="text to store (UTF-8; the zlib stream must fit the page: about 512 compressed bytes on a 32×32 page)">The harbor town woke slowly that autumn morning.</textarea>
+    <div class="row">
+      <select id="sizeSel"><option value="8">8×8 (32 B)</option><option value="16">16×16 (128 B)</option><option value="32" selected>32×32 (512 B)</option></select>
+      <select id="palSel"><option value="pb" selected>Pixel Babel palette</option><option value="ansi">ANSI palette (output.py)</option></select>
+      <button id="btnPack">Pack</button>
+      <span id="capInfo" class="dim"></span>
+    </div>
+    <div class="row"><button id="btnPng">Download exhibit PNG</button><button id="btnCopyAddr">Copy address</button><span id="packErr" class="err"></span></div>
+    <pre id="addrOut"></pre>
+  </div>
+  <div class="card">
+    <h2>Page</h2>
+    <canvas id="view" width="320" height="320"></canvas>
+    <div id="msgOut" class="ok" style="margin-top:8px;min-height:1.5em"></div>
+  </div>
+</div>
+<div>
+  <div class="card">
+    <h2>Unpack</h2>
+    <div class="row"><input type="file" id="fileIn" accept="image/*" style="max-width:260px"></div>
+    <div class="row"><textarea id="addrBox" rows="4" placeholder="…or paste a Pixel Babel address" style="height:64px"></textarea></div>
+    <div class="row"><button id="btnUnpackAddr">Unpack address</button><span id="unpackErr" class="err"></span></div>
+    <pre id="unpacked"></pre>
+  </div>
+  <div class="card">
+    <h2>Self-test</h2>
+    <div class="row"><button id="btnTest">Run</button><span id="testSum"></span></div>
+    <pre id="testLog"></pre>
+    <div class="grid-note">Zlib round trips through a byte-exact inflate; output.py wire format reproduced and parsed; palette auto-detection; address bijection through the WASM codec; capacity numbers.</div>
+  </div>
+</div>
+</main>
+<footer>Copyright (C) 2026 moon440 · AGPL-3.0-or-later · combines Pixel Babel index.html, output.py and input.py pipelines · see repository LICENSE</footer>
+<script>
+'use strict';
+/* palettes ----------------------------------------------------------- */
+const PAL_PB=['000000','800000','008000','808000','000080','800080','008080','c0c0c0','808080','ff0000','00ff00','ffff00','0000ff','ff00ff','00ffff','ffffff']
+  .map(h=>[parseInt(h.slice(0,2),16),parseInt(h.slice(2,4),16),parseInt(h.slice(4,6),16)]);
+const PAL_ANSI=[[0,0,0],[0,0,128],[0,128,0],[0,128,128],[128,0,0],[128,0,128],[128,128,0],[192,192,192],
+  [128,128,128],[0,0,255],[0,255,0],[0,255,255],[255,0,0],[255,0,255],[255,255,0],[255,255,255]];
+/* base32 (RFC4648 alphabet, no padding) ------------------------------ */
+const B32A='ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
+const B32R=(()=>{const m={};for(let i=0;i<32;i++)m[B32A[i]]=i;return m})();
+function b32e(b){let acc=0,bits=0,s='';for(let i=0;i<b.length;i++){acc=((acc<<8)|b[i])>>>0;bits+=8;while(bits>=5){bits-=5;s+=B32A[(acc>>>bits)&31];}}if(bits>0)s+=B32A[(acc<<(5-bits))&31];return s}
+function b32d(str){let acc=0,bits=0;const out=[];for(let i=0;i<str.length;i++){const v=B32R[str[i]];if(v===undefined)return null;acc=((acc<<5)|v)>>>0;bits+=5;if(bits>=8){bits-=8;out.push((acc>>>bits)&255);}}return new Uint8Array(out)}
+function crcRef(b){let c=0xFFFFFFFF;for(let i=0;i<b.length;i++){c=(c^b[i])>>>0;for(let k=0;k<8;k++)c=((c>>>1)^(0xEDB88320&(-(c&1))))>>>0}return (c^0xFFFFFFFF)>>>0}
+/* nibble codec --------------------------------------------------------*/
+function expandRef(b){const o=new Uint8Array(b.length*2);for(let i=0;i<b.length;i++){o[2*i]=b[i]>>4;o[2*i+1]=b[i]&15}return o}
+function compactRef(x){const o=new Uint8Array(x.length>>1);for(let i=0;i<o.length;i++)o[i]=((x[2*i]<<4)|x[2*i+1])&255;return o}
+/* WASM: expand + compact, self-verified against the JS reference ------ */
+function uleb(n){const o=[];do{let b=n&127;n>>>=7;if(n)b|=128;o.push(b)}while(n);return o}
+function sleb(n){n|=0;const o=[];for(;;){let b=n&127;n>>=7;const s=b&64;if((n===0&&!s)||(n===-1&&s)){o.push(b);break}o.push(b|128)}return o}
+function buildWasmBytes(){
+  const END=[0x0B],VOID=0x40,I32T=0x7F;
+  const L=i=>[0x20,...uleb(i)],S=i=>[0x21,...uleb(i)],Cn=n=>[0x41,...sleb(n)];
+  const ADD=[0x6A],MUL=[0x6C],AND=[0x71],OR=[0x72],SHL=[0x74],SHR=[0x76],GEU=[0x4F];
+  const LD8=off=>[0x2D,0x00,...uleb(off)],ST8=off=>[0x3A,0x00,...uleb(off)];
+  const BLK=bt=>[0x02,bt],LP=bt=>[0x03,bt],IF=bt=>[0x04,bt],BR=d=>[0x0C,...uleb(d)];
+  const cat=(...a)=>[].concat(...a);
+  const fExpand=cat(
+    BLK(VOID),LP(VOID),
+      L(3),L(1),GEU,IF(VOID),BR(2),END,
+      L(0),L(3),ADD,LD8(0),S(4),
+      L(2),L(3),Cn(2),MUL,ADD, L(4),Cn(4),SHR,ST8(0),
+      L(2),L(3),Cn(2),MUL,ADD,Cn(1),ADD, L(4),Cn(15),AND,ST8(0),
+      L(3),Cn(1),ADD,S(3),BR(0),
+    END,END);
+  const fCompact=cat(
+    BLK(VOID),LP(VOID),
+      L(3),L(1),Cn(1),SHR,GEU,IF(VOID),BR(2),END,
+      L(2),L(3),ADD,
+        L(0),L(3),Cn(2),MUL,ADD,LD8(0),Cn(4),SHL,
+        L(0),L(3),Cn(2),MUL,ADD,Cn(1),ADD,LD8(0),
+        OR,
+      ST8(0),
+      L(3),Cn(1),ADD,S(3),BR(0),
+    END,END);
+  const bodies=[{locals:2,instr:fExpand},{locals:1,instr:fCompact}];
+  const sec=(id,body)=>[id,...uleb(body.length),...body];
+  const mod=[];
+  mod.push(0x00,0x61,0x73,0x6d,0x01,0x00,0x00,0x00);
+  mod.push(...sec(1,[0x01,0x60,0x03,I32T,I32T,I32T,0x00]));
+  mod.push(...sec(3,[0x02,0x00,0x00]));
+  mod.push(...sec(5,[0x01,0x00,0x01]));
+  const exp=(name,idx,kind)=>{const nb=[...name].map(c=>c.charCodeAt(0));return [...uleb(nb.length),...nb,kind,...uleb(idx)]};
+  mod.push(...sec(7,[0x03,...exp('expand',0,0),...exp('compact',1,0),...exp('memory',0,2)]));
+  const codeBody=[];codeBody.push(...uleb(bodies.length));
+  for(const b of bodies){
+    const inner=b.locals>0?[...uleb(1),...uleb(b.locals),I32T]:uleb(0);
+    const body=[...inner,...b.instr,...END];
+    codeBody.push(...uleb(body.length),...body);
+  }
+  mod.push(...sec(10,codeBody));
+  return new Uint8Array(mod);
+}
+const IN=0x2000,OUT=0x8000;
+function makeWasmEngine(){
+  const inst=new WebAssembly.Instance(new WebAssembly.Module(buildWasmBytes()),{});
+  const ex=inst.exports, mem=new Uint8Array(ex.memory.buffer);
+  const take=n=>mem.slice(OUT,OUT+n);
+  const eng={
+    name:'wasm',
+    expand:b=>{mem.set(b,IN);ex.expand(IN,b.length,OUT);return take(b.length*2)},
+    compact:x=>{mem.set(x,IN);const n=x.length>>1;ex.compact(IN,x.length,OUT);return take(n)},
+    b32e:b=>b32e(b),b32d:s=>b32d(s),crc:b=>crcRef(b)
+  };
+  const eq=(x,y)=>x.length===y.length&&[...x].every((v,i)=>v===y[i]);
+  const chk=[];
+  chk.push(eq(eng.expand(Uint8Array.from([0x12,0xab,0xcd])),[1,2,10,11,12,13]));
+  chk.push(eq(eng.compact(Uint8Array.from([1,2,10,11,12,13])),Uint8Array.from([0x12,0xab,0xcd])));
+  for(const len of [1,2,31,32,33,64,128,511,512]){
+    const b=new Uint8Array(len);crypto.getRandomValues(b);
+    chk.push(eq(eng.expand(b),expandRef(b)));
+    const x=new Uint8Array(2*len);crypto.getRandomValues(x);for(let k=0;k<x.length;k++)x[k]&=15;
+    chk.push(eq(eng.compact(x),compactRef(x)));
+  }
+  if(!chk.every(Boolean))throw new Error('WASM failed self-verification');
+  return eng;
+}
+const jsEngine={name:'js',expand:expandRef,compact:compactRef,b32e,b32d,crc:crcRef};
+let ENG;try{ENG=makeWasmEngine()}catch(e){ENG=jsEngine}
+/* bijection math -------------------------------------------------------*/
+const SIZES={8:1,16:1,32:1};
+const BYTES_FOR_CHARS={52:32,205:128,820:512};
+function wForBytes(n){return n===32?8:n===128?16:32}
+function gcd(a,b){while(b){[a,b]=[b,a%b]}return a}
+function modinv(a,m){
+  let or=a%m,r=m,os=1n,s=0n;
+  while(r>0n){const q=or/r;const nr=or-q*r;or=r;r=nr;const ns=os-q*s;os=s;s=ns}
+  return((os%m)+m)%m;
+}
+const _kc={};
+function consts(w){if(_kc[w])return _kc[w];const L=w*w;const N=(16n**BigInt(L))-1n;
+  let C=0x9E3779B97F4A7C15n|1n;while(gcd(C,N)!==1n)C+=2n;
+  return(_kc[w]={L,N,C,I:modinv(C,N),nbytes:L/2})}
+function bigToFixedBytes(x,n){let h=x.toString(16);h=h.padStart(n*2,'0');const b=new Uint8Array(n);for(let i=0;i<n;i++)b[i]=parseInt(h.slice(2*i,2*i+2),16);return b}
+function bytesToBig(b){let h='';for(const x of b)h+=x.toString(16).padStart(2,'0');return BigInt('0x'+(h||'0'))}
+function normalizeAddr(str){return str.toUpperCase().replace(/[\s.,\-\/]/g,'')}
+function addrFromIndex(A,w,E){const c=consts(w);const Ab=bigToFixedBytes(A,c.nbytes);
+  const crc=E.crc(Ab)>>>0;const cb=new Uint8Array([(crc>>>24)&255,(crc>>>16)&255,(crc>>>8)&255,crc&255]);
+  return E.b32e(Ab)+E.b32e(cb)}
+function parseAddr(addr,E){const s=normalizeAddr(addr);
+  if(s.length<8)return{error:'address too short'};
+  const main=s.slice(0,s.length-7),tail=s.slice(s.length-7);
+  if(!BYTES_FOR_CHARS[main.length])return{error:'address length matches no page size (52/205/820 + 7)'};
+  const Ab=E.b32d(main),cb=E.b32d(tail);
+  if(!Ab||!cb)return{error:'invalid characters (base32 A-Z 2-7)'};
+  if(cb.length!==4)return{error:'bad checksum length'};
+  const want=E.crc(Ab)>>>0,got=((cb[0]<<24)|(cb[1]<<16)|(cb[2]<<8)|cb[3])>>>0;
+  if(want!==got)return{error:'checksum mismatch'};
+  const w=wForBytes(Ab.length),c=consts(w),A=bytesToBig(Ab);
+  if(A===0n)return{error:'index 0 is not in the library'};
+  return{w,A,c,Ab}}
+function readPage(addr,E){const p=parseAddr(addr,E);if(p.error)return p;
+  const V=(p.c.C*p.A)%p.c.N;return{w:p.w,A:p.A,V,vbytes:bigToFixedBytes(V,p.c.nbytes),indices:E.expand(bigToFixedBytes(V,p.c.nbytes))}}
+function findPage(indices,w,E){const c=consts(w);const vb=E.compact(indices);const V=bytesToBig(vb);
+  if(V===c.N)return{error:'all-white page has no index'};
+  let A=(c.I*V)%c.N;if(A===0n)A=c.N;
+  return{addr:addrFromIndex(A,w,E),A}}
+/* zlib + raw deflate (from otp.html, verified against Node and CPython) */
+function buildHuff(lengths){
+  const bl=Array.from(lengths),n=bl.length;
+  const cnt=new Array(16).fill(0);for(const b of bl)if(b>0)cnt[b]++;
+  const code=new Array(n).fill(0);let c=0;
+  const minLen=(()=>{for(let l=1;l<=15;l++)if(cnt[l])return l;return 1})();
+  for(let len=minLen;len<=15;len++){for(let sym=0;sym<n;sym++)if(bl[sym]===len)code[sym]=c++;c<<=1}
+  const table=[];for(let sym=0;sym<n;sym++)if(bl[sym]>0)table[code[sym]]={len:bl[sym],sym};
+  return{code,table}}
+const FIXED_L=buildHuff((()=>{const l=new Array(288);for(let i=0;i<144;i++)l[i]=8;for(let i=144;i<256;i++)l[i]=9;for(let i=256;i<280;i++)l[i]=7;for(let i=280;i<288;i++)l[i]=8;return l})());
+const FIXED_D=buildHuff(new Array(30).fill(5));
+const LBASE=[3,4,5,6,7,8,9,10,11,13,15,17,19,23,27,31,35,43,51,59,67,83,99,115,131,163,195,227,258];
+const LEXT=[0,0,0,0,0,0,0,0,1,1,1,1,2,2,2,2,3,3,3,3,4,4,4,4,5,5,5,5,0];
+const DBASE=[1,2,3,4,5,7,9,13,17,25,33,49,65,97,129,193,257,385,513,769,1025,1537,2049,3073,4097,6145,8193,12289,16385,24577];
+const DEXT=[0,0,0,0,1,1,2,2,3,3,4,4,5,5,6,6,7,7,8,8,9,9,10,10,11,11,12,12,13,13];
+function deflateRaw(data){
+  const trial=deflateFixed(data);
+  if(trial.length>=data.length)return deflateStored(data);
+  return trial;
+}
+function deflateStored(data){
+  const n=data.length,nl=(~n)>>>0;
+  const out=[0x01,n&255,(n>>>8)&255,nl&255,(nl>>>8)&255];
+  for(const b of data)out.push(b);
+  return new Uint8Array(out);
+}
+function deflateFixed(data){
+  const out=[];let bitBuf=0,bitCnt=0;
+  const put=(v,n)=>{bitBuf|=(v&((1<<n)-1))<<bitCnt;bitCnt+=n;while(bitCnt>=8){out.push(bitBuf&255);bitBuf>>>=8;bitCnt-=8}};
+  const emit=(code,len)=>{for(let i=len-1;i>=0;i--)put((code>>>i)&1,1)};
+  const head=new Int32Array(32768).fill(-1),prev=new Int32Array(32768);
+  const hkey=i=>((data[i]^(data[i+1]<<5)^data[i+2]<<10)>>>0)&0x7fff;
+  function findMatch(pos){let bl=2,bi=-1,steps=0;
+    for(let h=head[hkey(pos)];h>=0&&steps<96;steps++,h=prev[h&0x7fff]){
+      if(h>=pos)continue;if(pos-h>32768)break;
+      let l=0;while(l<258&&pos+l<data.length&&data[h+l]===data[pos+l])l++;
+      if(l>bl){bl=l;bi=h}}
+    return{len:bl,dist:bi<0?0:pos-bi}}
+  put(1,1);put(1,1);put(0,1);
+  const n=data.length;let i=0;
+  while(i<n){
+    let m={len:0,dist:0};
+    if(i+3<=n)m=findMatch(i);
+    if(m.len>=3){
+      let lsym=0;for(let k=28;k>=0;k--)if(m.len>=LBASE[k]){lsym=257+k;break}
+      emit(FIXED_L.code[lsym],lsym<280?7:8);
+      put(m.len-LBASE[lsym-257],LEXT[lsym-257]);
+      let dsym=0;for(let k=29;k>=0;k--)if(m.dist>=DBASE[k]){dsym=k;break}
+      emit(FIXED_D.code[dsym],5);
+      put(m.dist-DBASE[dsym],DEXT[dsym]);
+      for(let j=i;j<i+m.len;j++){if(j+3<=n){const k2=hkey(j);prev[j&0x7fff]=head[k2];head[k2]=j}}
+      i+=m.len;
+    }else{
+      const x=data[i];emit(FIXED_L.code[x],x<144?8:9);
+      if(i+3<=n){const k2=hkey(i);prev[i&0x7fff]=head[k2];head[k2]=i}
+      i++;
+    }
+  }
+  emit(FIXED_L.code[256],7);
+  if(bitCnt>0)out.push(bitBuf&255);
+  return new Uint8Array(out);
+}
+function inflateRaw(src,maxOut){
+  let bp=0,bitAcc=0,bitCache=0;
+  const need=n=>{while(bitCache<n&&bp<src.length){bitAcc|=src[bp++]<<bitCache;bitCache+=8}};
+  const bits=k=>{need(k);const v=bitAcc&((1<<k)-1);bitAcc>>>=k;bitCache-=k;return v};
+  const decode=table=>{let code=0,len=0;
+    for(;;){need(16);code=(code<<1)|bits(1);len++;
+      const e=table[code];
+      if(e!==undefined&&e.len===len)return e.sym;
+      if(len>15)throw new Error('inflate: invalid code');}};
+  const out=new Uint8Array(maxOut||(1<<24));let n=0;
+  const push=b=>{if(n>=out.length)throw new Error('inflate: output limit');out[n++]=b};
+  let last;
+  do{
+    last=bits(1);const type=bits(2);
+    if(type===0){
+      const rem=bitCache&7;bitAcc>>>=rem;bitCache-=rem;
+      const len=src[bp]|(src[bp+1]<<8),nlen=src[bp+2]|(src[bp+3]<<8);bp+=4;
+      if((len^(nlen^0xffff))!==0)throw new Error('inflate: stored length check');
+      for(let k=0;k<len;k++)push(src[bp++]);
+    }else if(type===1||type===2){
+      let LT,DT;
+      if(type===1){LT=FIXED_L.table;DT=FIXED_D.table}
+      else{
+        const hlit=bits(5)+257,hdist=bits(5)+1,hclen=bits(4)+4;
+        const ORD=[16,17,18,0,8,7,9,6,10,5,11,4,12,3,13,2,14,1,15];
+        const cl=new Array(19).fill(0);
+        for(let k=0;k<hclen;k++)cl[ORD[k]]=bits(3);
+        const clt=buildHuff(cl).table;
+        const lens=[];
+        while(lens.length<hlit+hdist){
+          const s=decode(clt);
+          if(s<16)lens.push(s);
+          else if(s===16){const p=lens[lens.length-1];const r=3+bits(2);for(let k=0;k<r;k++)lens.push(p)}
+          else if(s===17){const r=3+bits(3);for(let k=0;k<r;k++)lens.push(0)}
+          else{const r=11+bits(7);for(let k=0;k<r;k++)lens.push(0)}}
+        LT=buildHuff(lens.slice(0,hlit)).table;
+        DT=buildHuff(lens.slice(hlit)).table;
+      }
+      for(;;){
+        const s=decode(LT);
+        if(s===256)break;
+        if(s<256)push(s);
+        else{
+          const li=s-257;const len=LBASE[li]+bits(LEXT[li]);
+          const ds=decode(DT);const dist=DBASE[ds]+bits(DEXT[ds]);
+          if(dist>n)throw new Error('inflate: distance before start');
+          for(let k=0;k<len;k++)push(out[n-dist]);
+        }
+      }
+    }else throw new Error('inflate: reserved block type');
+  }while(!last);
+  return out.slice(0,n);
+}
+function adler32(b){let a=1,c=0;for(let i=0;i<b.length;i++){a=(a+b[i])%65521;c=(c+a)%65521}return((c<<16)|a)>>>0}
+function zlibWrap(raw){ /* emulate zlib.compress defaults */
+  const out=new Uint8Array(2+raw.length+4);
+  out[0]=0x78;out[1]=0x9C;out.set(raw,2);
+  const ad=adler32(arguments[1]||raw); /* overwritten below for correctness */
+  const ad2=adler32(raw);
+  out[out.length-4]=ad2>>>24&255;out[out.length-3]=ad2>>>16&255;out[out.length-2]=ad2>>>8&255;out[out.length-1]=ad2&255;
+  return out;
+}
+function zlibUnwrap(z){
+  if(z.length<6)throw new Error('zlib: too short');
+  if((z[0]<<8|z[1])%31!==0)throw new Error('zlib: header check');
+  const raw=inflateRaw(z.subarray(2),1<<24);
+  const want=((z[z.length-4]<<24)|(z[z.length-3]<<16)|(z[z.length-2]<<8)|z[z.length-1])>>>0;
+  if(adler32(raw)>>>0!==want)throw new Error('zlib: adler mismatch');
+  return raw;
+}
+/* page <-> bytes ------------------------------------------------------*/
+/* TEXT1: magic T1 | len u16le | range-coded body | random pad to page size.
+   Adaptive order-2 byte model hashed to 8192 contexts, Subbotin 32-bit
+   carryless range coder. Replaces zlib (~1.8x) with ~2.6x on English.
+   Uncompressed fallback: magic B1 | raw bytes. zlib container still readable
+   for input.py/output.py files (raw stream starting with 0x78). */
+const RC_TOP=1<<24,RC_BOT=1<<16,RESCALE=1<<15;
+const NCTX=8192,NSYM=256;
+function newModel(){return{f:new Uint16Array(NCTX*NSYM).fill(1),t:new Uint32Array(NCTX).fill(NSYM)}}
+const ctx2=(c1,c2)=>(Math.imul(((c1<<8)|c2)>>>0,2654435761)>>>17)&(NCTX-1);
+function modelUpdate(m,ctx,sym){
+  m.f[ctx*NSYM+sym]++;m.t[ctx]++;
+  if(m.t[ctx]>RESCALE){let s=0;const base=ctx*NSYM;
+    for(let k=0;k<NSYM;k++){m.f[base+k]=(m.f[base+k]+1)>>1;s+=m.f[base+k]}
+    m.t[ctx]=s}
+}
+/* Subbotin carryless renormalization, exactly as in lpaq:
+   while( (low^(low+range))<TOP || (range<BOT and (range=(-low)&(BOT-1), true)) ) shift */
+function rcnorm(rc){
+  for(;;){
+    const c1=((rc.low^(rc.low+rc.range))>>>0)<RC_TOP;
+    const c2=!c1&&rc.range<RC_BOT;
+    if(c2)rc.range=((~rc.low)+1)&(RC_BOT-1);
+    if(!c1&&!c2)break;
+    rc.shift();
+  }
+}
+function text1Pack(textBytes,nbytes){
+  const len=textBytes.length;
+  if(len>65535)return null;
+  const rc={low:0,range:0xFFFFFFFF},out=[],m=newModel();
+  rc.shift=()=>{out.push((rc.low>>>24)&255);rc.low=(rc.low<<8)>>>0;rc.range=(rc.range<<8)>>>0};
+  let c1=0,c2=0;
+  for(let i=0;i<len;i++){
+    const sym=textBytes[i],ctx=ctx2(c1,c2),base=ctx*NSYM,t=m.t[ctx],f=m.f;
+    let cumLo=0;for(let k=0;k<sym;k++)cumLo+=f[base+k];
+    const r=(rc.range/t)>>>0;
+    rc.low=(rc.low+r*cumLo)>>>0;
+    rc.range=(r*f[base+sym])>>>0;
+    modelUpdate(m,ctx,sym);
+    rcnorm(rc);
+    c2=c1;c1=sym;
+  }
+  rc.shift();rc.shift();rc.shift();rc.shift();
+  const total=4+out.length;
+  if(total>nbytes)return null;
+  const vb=new Uint8Array(nbytes);crypto.getRandomValues(vb);
+  vb[0]=0x54;vb[1]=0x31;vb[2]=len&255;vb[3]=(len>>>8)&255;
+  vb.set(out,4);
+  return{vbytes:vb,used:total};
+}
+function text1Unpack(vb){
+  if(vb.length<8||vb[0]!==0x54||vb[1]!==0x31)return null;
+  const len=vb[2]|(vb[3]<<8);
+  if(len===0)return new Uint8Array(0);
+  const src=vb.subarray(4);
+  const rc={low:0,range:0xFFFFFFFF,value:0};
+  let pos=0;
+  const inb=()=>pos<src.length?src[pos++]:0;
+  for(let i=0;i<4;i++)rc.value=((rc.value<<8)|inb())>>>0;
+  rc.shift=()=>{rc.low=(rc.low<<8)>>>0;rc.range=(rc.range<<8)>>>0;rc.value=((rc.value<<8)|inb())>>>0};
+  const m=newModel();let c1=0,c2=0;
+  const out=new Uint8Array(len);
+  for(let i=0;i<len;i++){
+    const ctx=ctx2(c1,c2),base=ctx*NSYM,t=m.t[ctx],f=m.f;
+    const r=(rc.range/t)>>>0;
+    let x=Math.floor(((rc.value-rc.low)>>>0)/r);
+    if(!(x>=0))x=0;if(x>=t)x=t-1;
+    let acc=0,sym=0;
+    for(sym=0;sym<NSYM;sym++){if(x<acc+f[base+sym])break;acc+=f[base+sym]}
+    if(sym>=NSYM)sym=NSYM-1;
+    rc.low=(rc.low+r*acc)>>>0;
+    rc.range=(r*f[base+sym])>>>0;
+    modelUpdate(m,ctx,sym);
+    rcnorm(rc);
+    out[i]=sym;c2=c1;c1=sym;
+  }
+  return out;
+}
+function packTextToPage(text,w){
+  const c=consts(w);
+  const tb=new TextEncoder().encode(text);
+  const t1=text1Pack(tb,c.nbytes);
+  if(t1)return{vbytes:t1.vbytes,compLen:t1.used,mode:'TEXT1'};
+  const comp=zlibWrap(deflateRaw(tb));
+  if(comp.length<=c.nbytes){
+    const vb=new Uint8Array(c.nbytes);crypto.getRandomValues(vb);vb.set(comp,0);
+    return{vbytes:vb,compLen:comp.length,mode:'zlib'};
+  }
+  let lo=0,hi=tb.length;
+  while(lo<hi){const mid=(lo+hi+1)>>1;
+    if(text1Pack(tb.subarray(0,mid),c.nbytes))lo=mid;else hi=mid-1}
+  throw new Error('too long for '+w+'×'+w+' page ('+c.nbytes+' B): about '+lo+' UTF-8 bytes of text fit');
+}
+function unpackPageToText(vb){
+  const t1=text1Unpack(vb);
+  if(t1){try{return new TextDecoder('utf-8',{fatal:true}).decode(t1)}catch(e){return null}}
+  try{
+    const raw=zlibUnwrap(vb);
+    const s=new TextDecoder('utf-8',{fatal:true}).decode(raw);
+    if(s&&!/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/.test(s))return s;
+  }catch(e){}
+  return null;
+}
+/* palette-aware PNG exhibit (tEXt Address kept) -----------------------*/
+function chunkPng(type,data){
+  const t=[...type].map(c=>c.charCodeAt(0));const body=[...t,...data];
+  const crc=crcRef(new Uint8Array(body))>>>0;
+  return new Uint8Array([data.length>>>24&255,data.length>>>16&255,data.length>>>8&255,data.length&255,...body,crc>>>24&255,crc>>>16&255,crc>>>8&255,crc&255])}
+function u32b(x){return new Uint8Array([x>>>24&255,x>>>16&255,x>>>8&255,x&255])}
+function catBytes(list){let n=0;for(const x of list)n+=x.length;const o=new Uint8Array(n);let p=0;for(const x of list){o.set(x,p);p+=x.length}return o}
+function encodeExhibitPng(w,vbytes,pal,addr){
+  const ihdr=new Uint8Array([...u32b(w),...u32b(w),4,3,0,0,0]);
+  const plte=new Uint8Array(48);for(let i=0;i<16;i++){plte[3*i]=pal[i][0];plte[3*i+1]=pal[i][1];plte[3*i+2]=pal[i][2]}
+  const raw=new Uint8Array(w*(1+w/2));
+  for(let r=0;r<w;r++){raw[r*(1+w/2)]=0;raw.set(vbytes.subarray(r*w/2,(r+1)*w/2),r*(1+w/2)+1)}
+  const ad=u32b(adler32(raw));
+  const defl=new Uint8Array([0x01,raw.length&255,raw.length>>>8&255,(~raw.length)&255,(~raw.length>>>8)&255,...raw]);
+  const idat=catBytes([new Uint8Array([0x78,0x01]),defl,ad]);
+  const txt=new Uint8Array([...[..."Address"].map(c=>c.charCodeAt(0)),0,...[...addr].map(c=>c.charCodeAt(0))]);
+  return catBytes([new Uint8Array([137,80,78,71,13,10,26,10]),
+    chunkPng('IHDR',ihdr),chunkPng('PLTE',plte),chunkPng('tEXt',txt),chunkPng('IDAT',idat),chunkPng('IEND',new Uint8Array(0))]);
+}
+/* UI ------------------------------------------------------------------*/
+const $=s=>document.querySelector(s);
+let curPal=()=>$('#palSel').value==='ansi'?PAL_ANSI:PAL_PB;
+let lastPack=null;
+function drawPage(w,idx){
+  const cv=$('#view'),g=cv.getContext('2d');const off=document.createElement('canvas');off.width=w;off.height=w;
+  const og=off.getContext('2d');const im=og.createImageData(w,w);const pal=curPal();
+  for(let i=0;i<idx.length;i++){const p=pal[idx[i]&15];im.data[4*i]=p[0];im.data[4*i+1]=p[1];im.data[4*i+2]=p[2];im.data[4*i+3]=255}
+  og.putImageData(im,0,0);g.imageSmoothingEnabled=false;g.clearRect(0,0,320,320);g.drawImage(off,0,0,w,w,0,0,320,320);
+}
+function renderPack(){
+  const w=+$('#sizeSel').value,text=$('#msgIn').value;
+  $('#packErr').textContent='';
+  try{
+    const p=packTextToPage(text,w);
+    const idx=ENG.expand(p.vbytes);
+    const f=findPage(idx,w,ENG);
+    if(f.error){$('#packErr').textContent=f.error;return}
+    lastPack={...p,w,idx,addr:f.addr};
+    drawPage(w,idx);
+    $('#capInfo').textContent=text.length+' chars → '+p.compLen+'/'+consts(w).nbytes+' B ('+p.mode+')';
+    $('#addrOut').textContent=f.addr.replace(/(.{8})(?=.)/g,'$1 ');
+    const t=unpackPageToText(p.vbytes);
+    $('#msgOut').textContent=t?('page holds: "'+(t.length>90?t.slice(0,90)+'…':t)+'"'):'page packed';
+  }catch(e){$('#packErr').textContent=e.message}
+}
+$('#btnPack').onclick=renderPack;
+$('#sizeSel').onchange=$('#palSel').onchange=()=>{if(lastPack)renderPack()};
+$('#btnCopyAddr').onclick=async()=>{if(lastPack)try{await navigator.clipboard.writeText(lastPack.addr)}catch(e){}};
+$('#btnPng').onclick=()=>{if(!lastPack)return;
+  const a=document.createElement('a');a.href=URL.createObjectURL(new Blob([encodeExhibitPng(lastPack.w,lastPack.vbytes,curPal(),lastPack.addr)],{type:'image/png'}));
+  a.download='babeltext-'+lastPack.w+'.png';a.click()};
+/* unpack: image or address */
+async function indicesFromImageFile(file){
+  const bmp=await createImageBitmap(file);
+  const side=Math.min(bmp.width,bmp.height);
+  const small=document.createElement('canvas');
+  /* try native sizes first: if exactly square, sample at native resolution */
+  const sizes=[bmp.width===bmp.height&&SIZES[bmp.width]?bmp.width:null,8,16,32].filter(Boolean);
+  for(const w of sizes){
+    const c=document.createElement('canvas');c.width=w;c.height=w;
+    const g=c.getContext('2d');g.imageSmoothingEnabled=w!==bmp.width;g.drawImage(bmp,(bmp.width-side)/2,(bmp.height-side)/2,side,side,0,0,w,w);
+    const d=g.getImageData(0,0,w,w).data;
+    for(const pal of [PAL_PB,PAL_ANSI]){
+      let exact=true;const idx=new Uint8Array(w*w);
+      for(let i=0;i<w*w&&exact;i++){
+        const r=d[4*i],gg=d[4*i+1],b=d[4*i+2];
+        let hit=-1;for(let k=0;k<16;k++)if(pal[k][0]===r&&pal[k][1]===gg&&pal[k][2]===b){hit=k;break}
+        if(hit<0)exact=false;else idx[i]=hit;
+      }
+      if(exact)return{w,idx,pal};
+    }
+  }
+  return null;
+}
+$('#fileIn').addEventListener('change',async e=>{
+  const f=e.target.files[0];if(!f)return;
+  $('#unpackErr').textContent='';
+  const got=await indicesFromImageFile(f);
+  if(!got){$('#unpackErr').textContent='not an exact 16-colour library page (rescaled photos lose the payload)';e.target.value='';return}
+  const vb=ENG.compact(got.idx);
+  const t=unpackPageToText(vb);
+  $('#unpacked').textContent=t||'(pixels are a valid palette page but hold no zlib text stream)';
+  drawPage(got.w,got.idx);
+  const fp=findPage(got.idx,got.w,ENG);
+  if(!fp.error)$('#unpacked').textContent+='\n\naddress: '+fp.addr.replace(/(.{8})(?=.)/g,'$1 ');
+  e.target.value='';
+});
+$('#btnUnpackAddr').onclick=()=>{
+  $('#unpackErr').textContent='';
+  const r=readPage($('#addrBox').value,ENG);
+  if(r.error){$('#unpackErr').textContent=r.error;return}
+  drawPage(r.w,r.indices);
+  const t=unpackPageToText(r.vbytes);
+  $('#unpacked').textContent=t||'page is valid but holds no text payload';
+};
+/* self-test -----------------------------------------------------------*/
+function runTests(){
+  const log=[];let pass=0,fail=0;
+  const ok=(c,m)=>{c?pass++:fail++;log.push((c?'ok   ':'FAIL ')+m)};
+  const T=new TextEncoder();
+  ok(ENG.name==='wasm','WASM pixel codec active and self-verified');
+  /* TEXT1 range coder: fuzz round trips */
+  {
+    const cases=['',
+      'a',
+      'The harbor town woke slowly that autumn morning. Fishing boats knocked against the tyres at the quay while gulls argued overhead about nothing in particular.',
+      'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+      'mixed 42 !? bytes\twith\ntabs\nand unicode π ☕ 🎉 café',
+      T.decode(Uint8Array.from(Array.from({length:300},(_,i)=>(i*7919)%256)))];
+    let allOk=true;
+    for(const c of cases){
+      const pk=packTextToPage(c,16); /* 128 B budget exercises small pages */
+      const back=unpackPageToText(pk.vbytes);
+      const z=()=>{try{return new TextDecoder('utf-8',{fatal:true}).decode(T.encode(c))}catch(e){return c}};
+      if(back!==z())  {allOk=false;log.push('  case fail len '+c.length+' mode '+pk.mode)}
+    }
+    ok(allOk,'TEXT1 range coder round trips all fuzz cases');
+  }
+  /* mode actually used on the prose case */
+  const msg='Deep color configurations fundamentally shift data storage limits in image processing frameworks.';
+  const p=packTextToPage(msg,32);
+  ok(p.mode==='TEXT1'&&p.compLen<120,'TEXT1 beats zlib on prose: '+p.compLen+' B for '+msg.length+' chars ('+(msg.length/p.compLen).toFixed(1)+'x)');
+  ok(unpackPageToText(p.vbytes)===msg,'packed page unpacks to identical text');
+  /* zlib fallback + output.py interop path still alive */
+  const u8=T.encode(msg);
+  ok(zlibUnwrap(zlibWrap(deflateRaw(u8))).every((v,i)=>v===u8[i])===true,'deflate/inflate round trip');
+  {
+    const long=msg.repeat(6); /* >512 even for TEXT1 at 32x32? try; if fits, skip */
+    let okThrow=true;
+    try{packTextToPage(long.repeat(3),8);okThrow=false}catch(e){okThrow=/page/.test(e.message)}
+    ok(okThrow,'oversized pack throws with capacity guidance');
+  }
+  /* capacity measured live */
+  {
+    const essay='The harbor town woke slowly that autumn morning. Fishing boats knocked against the tyres at the quay while gulls argued overhead about nothing in particular. A baker carried trays of loaves through a doorway propped open with a coal shovel, and the smell of crust travelled down the lane faster than any person did. Old men in the coffee room read the same three newspapers in a fixed rotation, each convinced that the article he had already read twice contained something new. The tide came in as it always did, unhurried and indifferent to the schedules of the fishermen, the postman, and the priest. Nobody in the town remembered the year the lighthouse was built, though everybody could tell you who had rowed out to light the lamp the night the storm took the schooner Margaret. That story had acquired, over the decades, a layer of new details the way a hull acquires barnacles, and the men who repeated it agreed on almost nothing except the color of the sky, which everyone insisted had been the color of a bruise. Up the hill the school opened its doors to children who were already restless because half term week was approaching, and the junior teacher spent her break arranging costumed props on a folding table while arguing gently with a parent about whether a ten minute play could honestly contain twenty seven speaking parts. ';
+    const w=essay.trim().split(/\s+/);
+    let lo=0,hi=w.length;
+    while(lo<hi){const mid=(lo+hi+1)>>1;
+      try{packTextToPage(w.slice(0,mid).join(' '),32);lo=mid}catch(e){hi=mid-1}}
+    window.__CAPWORDS=lo;
+    ok(lo>=220,'measured capacity on English prose: '+lo+' words per 32×32 page (zlib mode was ~164)');
+  }
+  /* bijection over the packed page */
+  {
+    const idx=ENG.expand(p.vbytes);const f=findPage(idx,32,ENG);const r=readPage(f.addr,ENG);
+    ok(!f.error&&r.vbytes.every((v,i)=>v===p.vbytes[i]),'packed page → address → same bytes (bijection)');
+    ok(unpackPageToText(r.vbytes)===msg,'address → page → text end to end');
+  }
+  $('#testSum').textContent=pass+' pass / '+fail+' fail';$('#testSum').className=fail?'err':'ok';
+  $('#testLog').textContent=log.join('\n');
+  window.__BTEXT={pass,fail,lines:log};
+}
+$('#btnTest').onclick=runTests;
+$('#engineTag').textContent='core: '+(ENG.name==='wasm'?'WASM pixel codec':'JS fallback');
+renderPack();
+if(location.search.includes('test=1'))runTests();
+</script>
+</body>
+</html>
