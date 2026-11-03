@@ -328,10 +328,11 @@ function inflateRaw(src,maxOut){
   return out.slice(0,n);
 }
 function adler32(b){let a=1,c=0;for(let i=0;i<b.length;i++){a=(a+b[i])%65521;c=(c+a)%65521}return((c<<16)|a)>>>0}
-function zlibWrap(raw){
-  const out=new Uint8Array(2+raw.length+4);
-  out[0]=0x78;out[1]=0x9C;out.set(raw,2);
-  const ad2=adler32(raw);
+function zlibWrap(deflated,data){
+  /* Adler-32 runs over the UNCOMPRESSED data (RFC 1950) */
+  const out=new Uint8Array(2+deflated.length+4);
+  out[0]=0x78;out[1]=0x9C;out.set(deflated,2);
+  const ad2=adler32(data);
   out[out.length-4]=ad2>>>24&255;out[out.length-3]=ad2>>>16&255;out[out.length-2]=ad2>>>8&255;out[out.length-1]=ad2&255;
   return out;
 }
@@ -427,7 +428,7 @@ function packTextToPage(text,w){
   const tb=new TextEncoder().encode(text);
   const t1=text1Pack(tb,c.nbytes);
   if(t1)return{vbytes:t1.vbytes,compLen:t1.used,mode:'TEXT1'};
-  const comp=zlibWrap(deflateRaw(tb));
+  const comp=zlibWrap(deflateRaw(tb),tb);
   if(comp.length<=c.nbytes){
     const vb=new Uint8Array(c.nbytes);crypto.getRandomValues(vb);vb.set(comp,0);
     return{vbytes:vb,compLen:comp.length,mode:'zlib'};
@@ -573,7 +574,7 @@ function runTests(){
   ok(unpackPageToText(p.vbytes)===msg,'packed page unpacks to identical text');
   /* zlib fallback + output.py interop path still alive */
   const u8=T.encode(msg);
-  ok(zlibUnwrap(zlibWrap(deflateRaw(u8))).every((v,i)=>v===u8[i])===true,'deflate/inflate round trip');
+  ok(zlibUnwrap(zlibWrap(deflateRaw(u8),u8)).every((v,i)=>v===u8[i])===true,'deflate/inflate round trip');
   {
     const long=msg.repeat(6); /* >512 even for TEXT1 at 32x32? try; if fits, skip */
     let okThrow=true;
