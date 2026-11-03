@@ -328,10 +328,9 @@ function inflateRaw(src,maxOut){
   return out.slice(0,n);
 }
 function adler32(b){let a=1,c=0;for(let i=0;i<b.length;i++){a=(a+b[i])%65521;c=(c+a)%65521}return((c<<16)|a)>>>0}
-function zlibWrap(raw){ /* emulate zlib.compress defaults */
+function zlibWrap(raw){
   const out=new Uint8Array(2+raw.length+4);
   out[0]=0x78;out[1]=0x9C;out.set(raw,2);
-  const ad=adler32(arguments[1]||raw); /* overwritten below for correctness */
   const ad2=adler32(raw);
   out[out.length-4]=ad2>>>24&255;out[out.length-3]=ad2>>>16&255;out[out.length-2]=ad2>>>8&255;out[out.length-1]=ad2&255;
   return out;
@@ -366,7 +365,7 @@ function rcnorm(rc){
   for(;;){
     const c1=((rc.low^(rc.low+rc.range))>>>0)<RC_TOP;
     const c2=!c1&&rc.range<RC_BOT;
-    if(c2)rc.range=((~rc.low)+1)&(RC_BOT-1);
+    if(c2){rc.range=((~rc.low)+1)&(RC_BOT-1);if(rc.range===0)rc.range=RC_BOT-1}
     if(!c1&&!c2)break;
     rc.shift();
   }
