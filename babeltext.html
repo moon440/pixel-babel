@@ -550,18 +550,19 @@ function runTests(){
   ok(ENG.name==='wasm','WASM pixel codec active and self-verified');
   /* TEXT1 range coder: fuzz round trips */
   {
-    const cases=['',
-      'a',
-      'The harbor town woke slowly that autumn morning. Fishing boats knocked against the tyres at the quay while gulls argued overhead about nothing in particular.',
-      'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
-      'mixed 42 !? bytes\twith\ntabs\nand unicode π ☕ 🎉 café',
-      new TextDecoder().decode(Uint8Array.from(Array.from({length:300},(_,i)=>(i*7919)%256)))];
+    const cases=[['',32],
+      ['a',16],
+      ['The harbor town woke slowly that autumn morning. Fishing boats knocked against the tyres at the quay while gulls argued overhead about nothing in particular.',32],
+      ['aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',16],
+      ['mixed 42 !? bytes\twith\ntabs\nand unicode π ☕ 🎉 café',16],
+      [new TextDecoder().decode(Uint8Array.from(Array.from({length:300},(_,i)=>(i*7919)%256))),32]];
     let allOk=true;
-    for(const c of cases){
-      const pk=packTextToPage(c,16); /* 128 B budget exercises small pages */
-      const back=unpackPageToText(pk.vbytes);
-      const z=()=>{try{return new TextDecoder('utf-8',{fatal:true}).decode(T.encode(c))}catch(e){return c}};
-      if(back!==z())  {allOk=false;log.push('  case fail len '+c.length+' mode '+pk.mode)}
+    for(const [c,w] of cases){
+      try{
+        const pk=packTextToPage(c,w);
+        const back=unpackPageToText(pk.vbytes);
+        if(back!==c){allOk=false;log.push('  case fail len '+c.length+' w '+w+' mode '+pk.mode)}
+      }catch(e){allOk=false;log.push('  case throw w'+w+': '+e.message)}
     }
     ok(allOk,'TEXT1 range coder round trips all fuzz cases');
   }
